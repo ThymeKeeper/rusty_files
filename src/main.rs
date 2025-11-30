@@ -387,11 +387,19 @@ impl FileExplorer {
         } else if cfg!(target_os = "macos") {
             Command::new("open")
                 .arg(path_str)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
                 .spawn()?;
         } else {
-            // Linux
-            Command::new("xdg-open")
-                .arg(path_str)
+            // Linux - use sh -c with setsid and full redirection to suppress all output
+            let command = format!("setsid -f xdg-open '{}' >/dev/null 2>&1 &", path_str);
+            Command::new("sh")
+                .arg("-c")
+                .arg(&command)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
                 .spawn()?;
         }
 
@@ -1934,6 +1942,10 @@ fn run_app<B: ratatui::backend::Backend>(
 
                             match key.code {
                                 KeyCode::Char('q') if ctrl => return Ok(()),
+                                KeyCode::Char('l') if ctrl => {
+                                    // Ctrl+L: Refresh/clear terminal display
+                                    terminal.clear()?;
+                                }
                                 KeyCode::Up => explorer.move_up(shift),
                                 KeyCode::Down => explorer.move_down(shift),
                                 KeyCode::Enter => explorer.open_or_enter()?,
