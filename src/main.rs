@@ -380,48 +380,18 @@ impl FileExplorer {
             io::Error::new(io::ErrorKind::InvalidInput, "Invalid path")
         })?;
 
-        // Use shell to properly detach the process in the background
         if cfg!(target_os = "windows") {
             Command::new("cmd")
                 .args(&["/c", "start", "", path_str])
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
                 .spawn()?;
         } else if cfg!(target_os = "macos") {
-            // macOS: run 'open' in background with timeout
-            Command::new("sh")
-                .arg("-c")
-                .arg(format!("(timeout 2 open '{}' || true) > /dev/null 2>&1 &", path_str))
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
+            Command::new("open")
+                .arg(path_str)
                 .spawn()?;
         } else {
-            // Linux: Check if file has a handler, then open with timeout
-            // First try to get MIME type and check for handler
-            let check_handler = Command::new("sh")
-                .arg("-c")
-                .arg(format!("xdg-mime query default $(xdg-mime query filetype '{}')", path_str))
-                .output();
-
-            if let Ok(output) = check_handler {
-                let handler = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                if handler.is_empty() || handler == "null" {
-                    return Err(io::Error::new(
-                        io::ErrorKind::NotFound,
-                        "No default application found for this file type"
-                    ));
-                }
-            }
-
-            // Open with timeout to prevent hanging
-            Command::new("sh")
-                .arg("-c")
-                .arg(format!("(timeout 2 xdg-open '{}' || true) > /dev/null 2>&1 &", path_str))
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
+            // Linux
+            Command::new("xdg-open")
+                .arg(path_str)
                 .spawn()?;
         }
 
