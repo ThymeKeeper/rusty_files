@@ -1963,7 +1963,7 @@ fn run_app<B: ratatui::backend::Backend>(
                             let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
 
                             match key.code {
-                                KeyCode::Esc => return Ok(()),
+                                KeyCode::Char('q') if ctrl => return Ok(()),
                                 KeyCode::Up => explorer.move_up(shift),
                                 KeyCode::Down => explorer.move_down(shift),
                                 KeyCode::Enter => explorer.open_or_enter()?,
