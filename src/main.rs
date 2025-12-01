@@ -8,7 +8,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
     Terminal,
 };
 use std::collections::{HashMap, HashSet};
@@ -16,12 +16,20 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::process::Command;
+use std::time::SystemTime;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum SortMode {
+    Name,
+    Date,
+}
 
 #[derive(Clone, Debug)]
 struct DirEntry {
     path: PathBuf,
     name: String,
     is_dir: bool,
+    modified: SystemTime,
 }
 
 #[derive(Clone, Debug)]
@@ -90,6 +98,7 @@ enum UIMode {
         cursor_pos: usize,
         selection_start: Option<usize>,
     },
+    Help,
 }
 
 #[derive(Clone, Debug)]
@@ -111,11 +120,13 @@ struct PendingOperation {
 #[allow(dead_code)]
 struct TreeLine {
     text: String,
+    timestamp: Option<String>, // Separate timestamp for styling
     entry_index: Option<usize>,
     is_selected: bool,
     is_cursor: bool,
     is_dir: bool,
     is_current_dir: bool,
+    is_hidden: bool, // Whether this is a hidden file/directory
 }
 
 struct FileExplorer {
@@ -133,6 +144,9 @@ struct FileExplorer {
     drag_selection: Option<usize>, // Tracks drag start index when dragging
     size_cache: HashMap<PathBuf, u64>, // Cache for file/directory sizes
     current_item_size: Option<u64>, // Size of item currently under cursor
+    sort_mode: SortMode, // Current sort mode (by name or by date)
+    terminal_width: usize, // Cached terminal width for rendering
+    show_hidden: bool, // Whether to show hidden files/directories
 }
 
 impl FileExplorer {
@@ -162,6 +176,9 @@ impl FileExplorer {
             drag_selection: None,
             size_cache: HashMap::new(),
             current_item_size: None,
+            sort_mode: SortMode::Name,
+            terminal_width: 100, // Default width, will be updated on first render
+            show_hidden: false, // Hidden files/directories are hidden by default
         };
         explorer.load_directory()?;
         Ok(explorer)
@@ -177,22 +194,55 @@ impl FileExplorer {
                     entry.file_name().into_string(),
                     entry.metadata()
                 ) {
+                    // Skip hidden files/directories if show_hidden is false
+                    if !self.show_hidden && name.starts_with('.') {
+                        continue;
+                    }
+
+                    let path = entry.path();
+                    let is_dir = metadata.is_dir();
+
+                    // Get modified time
+                    let modified = if is_dir {
+                        // For directories, get max modified time from contents (depth limit 1)
+                        Self::get_dir_max_modified(&path, 1)
+                    } else {
+                        // For files, use the file's modified time
+                        metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH)
+                    };
+
                     entries.push(DirEntry {
-                        path: entry.path(),
+                        path,
                         name,
-                        is_dir: metadata.is_dir(),
+                        is_dir,
+                        modified,
                     });
                 }
             }
         }
 
-        entries.sort_by(|a, b| {
-            match (a.is_dir, b.is_dir) {
-                (true, false) => std::cmp::Ordering::Less,
-                (false, true) => std::cmp::Ordering::Greater,
-                _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+        // Sort based on current sort mode
+        match self.sort_mode {
+            SortMode::Name => {
+                entries.sort_by(|a, b| {
+                    match (a.is_dir, b.is_dir) {
+                        (true, false) => std::cmp::Ordering::Less,
+                        (false, true) => std::cmp::Ordering::Greater,
+                        _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+                    }
+                });
             }
-        });
+            SortMode::Date => {
+                entries.sort_by(|a, b| {
+                    match (a.is_dir, b.is_dir) {
+                        (true, false) => std::cmp::Ordering::Less,
+                        (false, true) => std::cmp::Ordering::Greater,
+                        // Sort by modified time (newest first)
+                        _ => b.modified.cmp(&a.modified),
+                    }
+                });
+            }
+        }
 
         self.entries = entries;
 
@@ -215,7 +265,7 @@ impl FileExplorer {
         Ok(())
     }
 
-    fn build_tree_lines(&self) -> Vec<TreeLine> {
+    fn build_tree_lines(&self, terminal_width: usize) -> Vec<TreeLine> {
         let mut lines = Vec::new();
         let ancestors = self.get_ancestors();
 
@@ -231,11 +281,13 @@ impl FileExplorer {
 
             lines.push(TreeLine {
                 text: format!("{}{}{}", indent, marker, name),
+                timestamp: None,
                 entry_index: None,
                 is_selected: false,
                 is_cursor: false,
                 is_dir: true,
                 is_current_dir: is_current,
+                is_hidden: false,
             });
 
             if is_current && !self.entries.is_empty() {
@@ -243,14 +295,48 @@ impl FileExplorer {
                     let child_indent = "  ".repeat(depth + 1);
                     let icon = if entry.is_dir { "📁 " } else { "📄 " };
                     let marker = if entry.is_dir { "▶ " } else { "" };
+                    let date_str = Self::format_date(entry.modified);
+
+                    // Check if this is a hidden file/directory (starts with .)
+                    let is_hidden = entry.name.starts_with('.');
+
+                    // Calculate available width for filename
+                    // Date format is "YYYY-MM-DD HH:mm" (16 chars)
+                    let date_width = 16;
+                    let buffer = 3; // Space between filename and date
+
+                    // Icon is emoji (2 display columns) + space (1 column) = 3 columns
+                    // Marker "▶ " is 2 display columns (emoji 2 + space 0) or empty
+                    let icon_display_width = 3; // 📁 or 📄 emoji (2 cols) + space (1 col)
+                    let marker_display_width = if entry.is_dir { 2 } else { 0 }; // ▶ emoji + space or nothing
+                    let prefix_len = child_indent.len() + icon_display_width + marker_display_width;
+
+                    // Available width for filename
+                    let available_width = terminal_width.saturating_sub(prefix_len + date_width + buffer + 2); // +2 for borders
+
+                    // Truncate filename if needed
+                    let display_name = if entry.name.chars().count() > available_width {
+                        let truncate_at = available_width.saturating_sub(3); // Leave room for "..."
+                        let truncated: String = entry.name.chars().take(truncate_at).collect();
+                        format!("{}...", truncated)
+                    } else {
+                        entry.name.clone()
+                    };
+
+                    // Calculate padding to align date to the right
+                    let content_len = prefix_len + display_name.chars().count();
+                    let padding_needed = terminal_width.saturating_sub(content_len + date_width + 2); // +2 for borders
+                    let padding = " ".repeat(padding_needed);
 
                     lines.push(TreeLine {
-                        text: format!("{}{}{}{}", child_indent, icon, marker, entry.name),
+                        text: format!("{}{}{}{}{}", child_indent, icon, marker, display_name, padding),
+                        timestamp: Some(date_str),
                         entry_index: Some(i),
                         is_selected: self.selected_indices.contains(&i),
                         is_cursor: i == self.cursor_index,
                         is_dir: entry.is_dir,
                         is_current_dir: false,
+                        is_hidden,
                     });
                 }
             }
@@ -259,8 +345,8 @@ impl FileExplorer {
         lines
     }
 
-    fn get_cursor_line_index(&self) -> usize {
-        let tree_lines = self.build_tree_lines();
+    fn get_cursor_line_index(&self, terminal_width: usize) -> usize {
+        let tree_lines = self.build_tree_lines(terminal_width);
         for (line_idx, line) in tree_lines.iter().enumerate() {
             if line.is_cursor {
                 return line_idx;
@@ -446,7 +532,7 @@ impl FileExplorer {
     }
 
     fn handle_mouse_down(&mut self, row: u16, _col: u16, modifiers: KeyModifiers, area_top: u16) {
-        let tree_lines = self.build_tree_lines();
+        let tree_lines = self.build_tree_lines(self.terminal_width);
         let clicked_line = (row as usize).saturating_sub(area_top as usize + 1).saturating_add(self.scroll_offset);
 
         if clicked_line < tree_lines.len() {
@@ -475,7 +561,7 @@ impl FileExplorer {
             return;
         }
 
-        let tree_lines = self.build_tree_lines();
+        let tree_lines = self.build_tree_lines(self.terminal_width);
         let dragged_line = (row as usize).saturating_sub(area_top as usize + 1).saturating_add(self.scroll_offset);
 
         if dragged_line < tree_lines.len() {
@@ -1268,6 +1354,66 @@ impl FileExplorer {
         }
     }
 
+    fn format_date(time: SystemTime) -> String {
+        // Format as YYYY-MM-DD HH:mm
+        if let Ok(duration) = time.duration_since(SystemTime::UNIX_EPOCH) {
+            let secs = duration.as_secs();
+
+            // Calculate days since epoch
+            let days = (secs / 86400) as i64;
+
+            // Calculate time components
+            let remaining_secs = secs % 86400;
+            let hours = remaining_secs / 3600;
+            let minutes = (remaining_secs % 3600) / 60;
+
+            // Simple date calculation (approximation)
+            // This is a basic calculation - for production use a proper date library
+            let mut year = 1970;
+            let mut remaining_days = days;
+
+            // Account for leap years approximately
+            loop {
+                let days_in_year = if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) {
+                    366
+                } else {
+                    365
+                };
+
+                if remaining_days >= days_in_year {
+                    remaining_days -= days_in_year;
+                    year += 1;
+                } else {
+                    break;
+                }
+            }
+
+            // Calculate month and day (simple approximation)
+            let days_per_month = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+            let mut month = 1;
+            let mut day_of_month = remaining_days + 1;
+
+            for (i, &days_in_month) in days_per_month.iter().enumerate() {
+                let days_this_month = if i == 1 && year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) {
+                    29
+                } else {
+                    days_in_month
+                };
+
+                if day_of_month > days_this_month {
+                    day_of_month -= days_this_month;
+                    month += 1;
+                } else {
+                    break;
+                }
+            }
+
+            return format!("{:04}-{:02}-{:02} {:02}:{:02}", year, month, day_of_month, hours, minutes);
+        }
+
+        "Unknown         ".to_string()
+    }
+
     fn get_file_size(path: &PathBuf) -> u64 {
         if let Ok(metadata) = fs::metadata(path) {
             if metadata.is_file() {
@@ -1311,6 +1457,14 @@ impl FileExplorer {
         }
     }
 
+    fn toggle_help(&mut self) {
+        if matches!(self.ui_mode, UIMode::Help) {
+            self.ui_mode = UIMode::Normal;
+        } else {
+            self.ui_mode = UIMode::Help;
+        }
+    }
+
     fn get_ancestors(&self) -> Vec<PathBuf> {
         let mut ancestors = Vec::new();
         let mut current = self.current_dir.clone();
@@ -1326,6 +1480,80 @@ impl FileExplorer {
         }
 
         ancestors
+    }
+
+    fn get_dir_max_modified(path: &PathBuf, max_depth: usize) -> SystemTime {
+        Self::get_dir_max_modified_recursive(path, max_depth, 0)
+    }
+
+    fn get_dir_max_modified_recursive(path: &PathBuf, max_depth: usize, current_depth: usize) -> SystemTime {
+        let mut max_time = SystemTime::UNIX_EPOCH;
+
+        // Get the directory's own modification time
+        if let Ok(metadata) = fs::metadata(path) {
+            if let Ok(modified) = metadata.modified() {
+                max_time = modified;
+            }
+        }
+
+        // If we've reached max depth, return the directory's own time
+        if current_depth >= max_depth {
+            return max_time;
+        }
+
+        // Scan immediate files/subdirectories
+        if let Ok(entries) = fs::read_dir(path) {
+            for entry in entries.flatten() {
+                if let Ok(metadata) = entry.metadata() {
+                    if let Ok(modified) = metadata.modified() {
+                        if metadata.is_file() {
+                            // For files, just check the modified time
+                            if modified > max_time {
+                                max_time = modified;
+                            }
+                        } else if metadata.is_dir() && current_depth + 1 <= max_depth {
+                            // For subdirectories, recurse if we haven't hit depth limit
+                            let sub_max = Self::get_dir_max_modified_recursive(&entry.path(), max_depth, current_depth + 1);
+                            if sub_max > max_time {
+                                max_time = sub_max;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        max_time
+    }
+
+    fn toggle_sort_mode(&mut self) -> io::Result<()> {
+        self.sort_mode = match self.sort_mode {
+            SortMode::Name => SortMode::Date,
+            SortMode::Date => SortMode::Name,
+        };
+
+        let mode_name = match self.sort_mode {
+            SortMode::Name => "Name",
+            SortMode::Date => "Date Modified",
+        };
+        self.show_status(format!("Sorting by: {}", mode_name));
+
+        self.load_directory()?;
+        Ok(())
+    }
+
+    fn toggle_hidden(&mut self) -> io::Result<()> {
+        self.show_hidden = !self.show_hidden;
+
+        let status_msg = if self.show_hidden {
+            "Showing hidden files"
+        } else {
+            "Hiding hidden files"
+        };
+        self.show_status(status_msg.to_string());
+
+        self.load_directory()?;
+        Ok(())
     }
 }
 
@@ -1360,39 +1588,74 @@ fn run_app<B: ratatui::backend::Backend>(
             let main_area = chunks[0];
             let status_bar_area = chunks[1];
             let visible_height = main_area.height.saturating_sub(2) as usize;
+            let terminal_width = main_area.width as usize;
 
-            let tree_lines = explorer.build_tree_lines();
+            // Update cached terminal width
+            explorer.terminal_width = terminal_width;
+
+            let tree_lines = explorer.build_tree_lines(terminal_width);
             explorer.calculate_scroll_offset(visible_height, &tree_lines);
 
             let tree_items: Vec<ListItem> = tree_lines
                 .iter()
                 .map(|tree_line| {
-                    let style = if tree_line.is_cursor && tree_line.is_selected {
-                        Style::default()
-                            .fg(Color::White)
-                            .bg(Color::Blue)
-                            .add_modifier(Modifier::BOLD)
+                    // Determine base text color
+                    let text_color = if tree_line.is_cursor && tree_line.is_selected {
+                        Color::White
                     } else if tree_line.is_cursor {
-                        Style::default()
-                            .fg(Color::White)
-                            .bg(Color::DarkGray)
-                            .add_modifier(Modifier::BOLD)
+                        Color::White
                     } else if tree_line.is_selected {
-                        Style::default()
-                            .fg(Color::LightCyan)
-                            .bg(Color::DarkGray)
+                        Color::LightCyan
                     } else if tree_line.is_current_dir {
-                        Style::default()
-                            .fg(Color::Blue)
-                    } else if tree_line.is_dir {
-                        Style::default()
-                            .fg(Color::DarkGray)
+                        Color::Blue
+                    } else if tree_line.is_hidden {
+                        // Hidden files/directories use dark gray
+                        Color::DarkGray
                     } else {
-                        Style::default()
-                            .fg(Color::Gray)
+                        // Both directories and files use gray
+                        Color::Gray
                     };
 
-                    ListItem::new(Line::from(Span::styled(&tree_line.text, style)))
+                    // Determine background and modifiers
+                    let (bg_color, modifiers) = if tree_line.is_cursor && tree_line.is_selected {
+                        (Some(Color::Blue), Modifier::BOLD)
+                    } else if tree_line.is_cursor {
+                        (Some(Color::DarkGray), Modifier::BOLD)
+                    } else if tree_line.is_selected {
+                        (Some(Color::DarkGray), Modifier::empty())
+                    } else {
+                        (None, Modifier::empty())
+                    };
+
+                    // Create style for main text
+                    let mut text_style = Style::default()
+                        .fg(text_color)
+                        .add_modifier(modifiers);
+                    if let Some(bg) = bg_color {
+                        text_style = text_style.bg(bg);
+                    }
+
+                    // Create style for timestamp - use lighter color when highlighted for readability
+                    let timestamp_color = if tree_line.is_cursor || tree_line.is_selected {
+                        Color::Gray  // Lighter gray for highlighted lines
+                    } else {
+                        Color::DarkGray  // Dark gray for normal lines
+                    };
+
+                    let mut timestamp_style = Style::default()
+                        .fg(timestamp_color)
+                        .add_modifier(modifiers);
+                    if let Some(bg) = bg_color {
+                        timestamp_style = timestamp_style.bg(bg);
+                    }
+
+                    // Build line with separate styling for text and timestamp
+                    let mut spans = vec![Span::styled(&tree_line.text, text_style)];
+                    if let Some(timestamp) = &tree_line.timestamp {
+                        spans.push(Span::styled(timestamp, timestamp_style));
+                    }
+
+                    ListItem::new(Line::from(spans))
                 })
                 .collect();
 
@@ -1410,7 +1673,7 @@ fn run_app<B: ratatui::backend::Backend>(
                         .title(Span::styled(format!("File Explorer: {}", current_dir_str), title_style))
                 );
 
-            let cursor_line_idx = explorer.get_cursor_line_index();
+            let cursor_line_idx = explorer.get_cursor_line_index(terminal_width);
             let mut list_state = ListState::default()
                 .with_selected(Some(cursor_line_idx))
                 .with_offset(explorer.scroll_offset);
@@ -1531,6 +1794,57 @@ fn run_app<B: ratatui::backend::Backend>(
                     }
                     _ => {}
                 }
+            }
+
+            // Render help overlay over entire screen if in Help mode
+            if matches!(explorer.ui_mode, UIMode::Help) {
+                // Clear the entire screen first
+                f.render_widget(Clear, area);
+
+                let help_text = vec![
+                    "Keyboard Shortcuts",
+                    "",
+                    "Navigation:",
+                    "  Up/Down        - Move cursor",
+                    "  Left           - Go to parent directory",
+                    "  Right          - Enter directory",
+                    "  Enter          - Open file/directory",
+                    "",
+                    "Selection:",
+                    "  Shift+Up/Down  - Select range",
+                    "  Ctrl+Space     - Toggle selection",
+                    "  Mouse drag     - Select multiple",
+                    "",
+                    "File Operations:",
+                    "  Ctrl+C         - Copy",
+                    "  Ctrl+X         - Cut",
+                    "  Ctrl+V         - Paste",
+                    "  Ctrl+N         - Create new",
+                    "  Ctrl+R         - Rename",
+                    "  Ctrl+D/Delete  - Delete",
+                    "  Ctrl+Z         - Undo",
+                    "",
+                    "View Options:",
+                    "  Ctrl+S         - Toggle sort (Name/Date)",
+                    "  Ctrl+H         - Toggle hidden files",
+                    "  Ctrl+L         - Refresh display",
+                    "",
+                    "Other:",
+                    "  F1             - Show/hide this help",
+                    "  Ctrl+Q         - Quit",
+                    "",
+                    "Press F1 or Esc to close this help",
+                ].join("\n");
+
+                let para = Paragraph::new(help_text)
+                    .block(Block::default()
+                        .borders(Borders::ALL)
+                        .title("Help - Keyboard Shortcuts")
+                        .title_alignment(Alignment::Center))
+                    .style(Style::default().fg(Color::White).bg(Color::Black))
+                    .alignment(Alignment::Left)
+                    .wrap(Wrap { trim: false });
+                f.render_widget(para, area);
             }
         })?;
 
@@ -1700,7 +2014,7 @@ fn run_app<B: ratatui::backend::Backend>(
                                 _ => {}
                             }
                         }
-                        UIMode::RenameItem { original_path, new_name, cursor_pos, selection_start } => {
+                        UIMode::RenameItem { original_path, new_name, .. } => {
                             let shift = key.modifiers.contains(KeyModifiers::SHIFT);
                             let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
 
@@ -1936,11 +2250,22 @@ fn run_app<B: ratatui::backend::Backend>(
                                 _ => {}
                             }
                         }
+                        UIMode::Help => {
+                            match key.code {
+                                KeyCode::F(1) | KeyCode::Esc => {
+                                    explorer.toggle_help();
+                                }
+                                _ => {}
+                            }
+                        }
                         UIMode::Normal | UIMode::StatusMessage { .. } => {
                             let shift = key.modifiers.contains(KeyModifiers::SHIFT);
                             let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
 
                             match key.code {
+                                KeyCode::F(1) => {
+                                    explorer.toggle_help();
+                                }
                                 KeyCode::Char('q') if ctrl => return Ok(()),
                                 KeyCode::Char('l') if ctrl => {
                                     // Ctrl+L: Refresh/clear terminal display
@@ -1977,6 +2302,12 @@ fn run_app<B: ratatui::backend::Backend>(
                                 }
                                 KeyCode::Char('z') if ctrl => {
                                     explorer.undo()?;
+                                }
+                                KeyCode::Char('s') if ctrl => {
+                                    explorer.toggle_sort_mode()?;
+                                }
+                                KeyCode::Char('h') if ctrl => {
+                                    explorer.toggle_hidden()?;
                                 }
                                 _ => {}
                             }
