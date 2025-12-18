@@ -678,7 +678,15 @@ impl FileExplorer {
 
         match creation_type {
             CreationType::File => {
-                fs::File::create(&new_path)?;
+                // Create file with default content based on extension
+                let mut file = fs::File::create(&new_path)?;
+
+                // Add default content based on file extension to ensure proper MIME type detection
+                let default_content = Self::get_default_file_content(&name);
+                if !default_content.is_empty() {
+                    file.write_all(default_content.as_bytes())?;
+                }
+
                 self.show_status(format!("Created file '{}'", name));
             }
             CreationType::Directory => {
@@ -693,6 +701,32 @@ impl FileExplorer {
         self.select_items_by_name(&[name]);
 
         Ok(())
+    }
+
+    fn get_default_file_content(filename: &str) -> String {
+        // Get file extension
+        let extension = if let Some(dot_pos) = filename.rfind('.') {
+            &filename[dot_pos + 1..]
+        } else {
+            return "\n".to_string(); // Default: just a newline for files without extension
+        };
+
+        // Return appropriate default content based on extension
+        match extension.to_lowercase().as_str() {
+            "py" => "#!/usr/bin/env python3\n".to_string(),
+            "sh" | "bash" => "#!/bin/bash\n".to_string(),
+            "rb" => "#!/usr/bin/env ruby\n".to_string(),
+            "pl" => "#!/usr/bin/env perl\n".to_string(),
+            "js" | "ts" | "jsx" | "tsx" => "// \n".to_string(),
+            "html" | "htm" => "<!DOCTYPE html>\n<html>\n<head>\n    <title></title>\n</head>\n<body>\n    \n</body>\n</html>\n".to_string(),
+            "css" => "/* */\n".to_string(),
+            "rs" => "fn main() {\n    \n}\n".to_string(),
+            "c" | "cpp" | "cc" | "h" | "hpp" => "// \n".to_string(),
+            "java" => "// \n".to_string(),
+            "go" => "package main\n\nfunc main() {\n    \n}\n".to_string(),
+            "md" | "markdown" => "# \n".to_string(),
+            _ => "\n".to_string(), // Default: just a newline
+        }
     }
 
     fn start_rename(&mut self) {
