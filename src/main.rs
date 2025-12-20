@@ -8,7 +8,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
+    widgets::{Block, Clear, List, ListItem, ListState, Paragraph, Wrap},
     Terminal,
 };
 use std::collections::{HashMap, HashSet};
@@ -119,6 +119,7 @@ struct PendingOperation {
 
 #[allow(dead_code)]
 struct TreeLine {
+    tree_prefix: String, // The indent + tree chars + icon part (styled dimly)
     text: String,
     timestamp: Option<String>, // Separate timestamp for styling
     entry_index: Option<usize>,
@@ -270,17 +271,27 @@ impl FileExplorer {
         let ancestors = self.get_ancestors();
 
         for (depth, path) in ancestors.iter().enumerate() {
+            // Simple indentation without vertical pipes
             let indent = "  ".repeat(depth);
+
             let name = path.file_name()
                 .and_then(|n| n.to_str())
                 .unwrap_or("/")
                 .to_string();
 
             let is_current = path == &self.current_dir;
-            let marker = if is_current { "▼ " } else { "▶ " };
+            // Use corner pipe (└─) for directories on path to current
+            let marker = if depth == ancestors.len() - 1 {
+                "└─"  // Current directory (last in ancestors list)
+            } else if depth > 0 {
+                "└─"  // Intermediate directories on path
+            } else {
+                "─ "  // Root directory
+            };
 
             lines.push(TreeLine {
-                text: format!("{}{}{}", indent, marker, name),
+                tree_prefix: format!("{}{}", indent, marker),
+                text: name,
                 timestamp: None,
                 entry_index: None,
                 is_selected: false,
@@ -291,10 +302,14 @@ impl FileExplorer {
             });
 
             if is_current && !self.entries.is_empty() {
+                // Child items should be indented one level more than the current directory
+                // Add one extra space after the base indentation
+                let child_indent = format!("{}  ", "  ".repeat(depth));
+
                 for (i, entry) in self.entries.iter().enumerate() {
-                    let child_indent = "  ".repeat(depth + 1);
-                    let icon = if entry.is_dir { "📁 " } else { "📄 " };
-                    let marker = if entry.is_dir { "▶ " } else { "" };
+                    let is_last = i == self.entries.len() - 1;
+                    let tree_char = if is_last { "└─" } else { "├─" };
+                    let icon = if entry.is_dir { "" } else { "" };  // Nerd font folder and file icons
                     let date_str = Self::format_date(entry.modified);
 
                     // Check if this is a hidden file/directory (starts with .)
@@ -305,14 +320,14 @@ impl FileExplorer {
                     let date_width = 16;
                     let buffer = 3; // Space between filename and date
 
-                    // Icon is emoji (2 display columns) + space (1 column) = 3 columns
-                    // Marker "▶ " is 2 display columns (emoji 2 + space 0) or empty
-                    let icon_display_width = 3; // 📁 or 📄 emoji (2 cols) + space (1 col)
-                    let marker_display_width = if entry.is_dir { 2 } else { 0 }; // ▶ emoji + space or nothing
-                    let prefix_len = child_indent.len() + icon_display_width + marker_display_width;
+                    // tree_char "├─" or "└─" is 2 chars
+                    // icon "" or "" is 1 char + space = 2 chars
+                    let tree_char_width = 2;
+                    let icon_display_width = 2; // " " or " "
+                    let prefix_len = child_indent.len() + tree_char_width + icon_display_width;
 
                     // Available width for filename
-                    let available_width = terminal_width.saturating_sub(prefix_len + date_width + buffer + 2); // +2 for borders
+                    let available_width = terminal_width.saturating_sub(prefix_len + date_width + buffer); // No border anymore
 
                     // Truncate filename if needed
                     let display_name = if entry.name.chars().count() > available_width {
@@ -325,11 +340,12 @@ impl FileExplorer {
 
                     // Calculate padding to align date to the right
                     let content_len = prefix_len + display_name.chars().count();
-                    let padding_needed = terminal_width.saturating_sub(content_len + date_width + 2); // +2 for borders
+                    let padding_needed = terminal_width.saturating_sub(content_len + date_width); // No border anymore
                     let padding = " ".repeat(padding_needed);
 
                     lines.push(TreeLine {
-                        text: format!("{}{}{}{}{}", child_indent, icon, marker, display_name, padding),
+                        tree_prefix: format!("{}{} {} ", child_indent, tree_char, icon),
+                        text: format!("{}{}", display_name, padding),
                         timestamp: Some(date_str),
                         entry_index: Some(i),
                         is_selected: self.selected_indices.contains(&i),
@@ -1633,30 +1649,37 @@ fn run_app<B: ratatui::backend::Backend>(
             let tree_items: Vec<ListItem> = tree_lines
                 .iter()
                 .map(|tree_line| {
-                    // Determine base text color
+                    // Determine base text color using sage's color scheme
+                    // Green for files, brown for directories, dimmer for hidden
                     let text_color = if tree_line.is_cursor && tree_line.is_selected {
-                        Color::White
+                        Color::Rgb(165, 162, 157) // Bright neutral grey (normal text)
                     } else if tree_line.is_cursor {
-                        Color::White
+                        Color::Rgb(165, 162, 157) // Bright neutral grey
                     } else if tree_line.is_selected {
-                        Color::LightCyan
+                        Color::Rgb(190, 182, 165) // Very bright (brighter than function color)
                     } else if tree_line.is_current_dir {
-                        Color::Blue
+                        Color::Rgb(160, 150, 135) // Bright grey with warm hint (keywords)
+                    } else if tree_line.is_hidden && tree_line.is_dir {
+                        // Hidden directories use very dark grey
+                        Color::Rgb(75, 75, 75) // Very dark grey (near comment color)
                     } else if tree_line.is_hidden {
-                        // Hidden files/directories use dark gray
-                        Color::DarkGray
+                        // Hidden files use very dim grey
+                        Color::Rgb(100, 100, 98) // Dark neutral grey (punctuation color)
+                    } else if tree_line.is_dir {
+                        // Directories use dim grey (much darker than files)
+                        Color::Rgb(130, 125, 115)
                     } else {
-                        // Both directories and files use gray
-                        Color::Gray
+                        // Files use very bright grey (much lighter than directories)
+                        Color::Rgb(190, 182, 165)
                     };
 
                     // Determine background and modifiers
                     let (bg_color, modifiers) = if tree_line.is_cursor && tree_line.is_selected {
-                        (Some(Color::Blue), Modifier::BOLD)
+                        (Some(Color::Rgb(60, 60, 60)), Modifier::BOLD) // Darker background
                     } else if tree_line.is_cursor {
-                        (Some(Color::DarkGray), Modifier::BOLD)
+                        (Some(Color::Rgb(50, 50, 50)), Modifier::BOLD) // Dark background
                     } else if tree_line.is_selected {
-                        (Some(Color::DarkGray), Modifier::empty())
+                        (Some(Color::Rgb(45, 45, 45)), Modifier::empty()) // Subtle dark background
                     } else {
                         (None, Modifier::empty())
                     };
@@ -1669,11 +1692,20 @@ fn run_app<B: ratatui::backend::Backend>(
                         text_style = text_style.bg(bg);
                     }
 
-                    // Create style for timestamp - use lighter color when highlighted for readability
+                    // Create style for tree prefix (very dim - dimmer than hidden items)
+                    let tree_prefix_color = Color::Rgb(65, 65, 65);  // Very dark grey (comment color)
+                    let mut tree_prefix_style = Style::default()
+                        .fg(tree_prefix_color)
+                        .add_modifier(modifiers);
+                    if let Some(bg) = bg_color {
+                        tree_prefix_style = tree_prefix_style.bg(bg);
+                    }
+
+                    // Create style for timestamp - use grey
                     let timestamp_color = if tree_line.is_cursor || tree_line.is_selected {
-                        Color::Gray  // Lighter gray for highlighted lines
+                        Color::Rgb(130, 130, 126)  // Medium-light neutral grey (type color)
                     } else {
-                        Color::DarkGray  // Dark gray for normal lines
+                        Color::Rgb(120, 120, 117)  // Medium-dark neutral grey (operator color)
                     };
 
                     let mut timestamp_style = Style::default()
@@ -1683,8 +1715,11 @@ fn run_app<B: ratatui::backend::Backend>(
                         timestamp_style = timestamp_style.bg(bg);
                     }
 
-                    // Build line with separate styling for text and timestamp
-                    let mut spans = vec![Span::styled(&tree_line.text, text_style)];
+                    // Build line with separate styling for tree prefix, text, and timestamp
+                    let mut spans = vec![
+                        Span::styled(&tree_line.tree_prefix, tree_prefix_style),
+                        Span::styled(&tree_line.text, text_style)
+                    ];
                     if let Some(timestamp) = &tree_line.timestamp {
                         spans.push(Span::styled(timestamp, timestamp_style));
                     }
@@ -1695,15 +1730,12 @@ fn run_app<B: ratatui::backend::Backend>(
 
             let current_dir_str = explorer.current_dir.display().to_string();
             let title_style = Style::default()
-                .fg(Color::DarkGray)
+                .fg(Color::Rgb(65, 65, 65))  // Very dark grey (comment color)
                 .add_modifier(Modifier::BOLD);
-            let border_style = Style::default().fg(Color::DarkGray);
 
             let tree_list = List::new(tree_items)
                 .block(
                     Block::default()
-                        .borders(Borders::ALL)
-                        .border_style(border_style)
                         .title(Span::styled(format!("File Explorer: {}", current_dir_str), title_style))
                 );
 
@@ -1734,7 +1766,7 @@ fn run_app<B: ratatui::backend::Backend>(
             };
 
             let status_bar = Paragraph::new(status_text)
-                .style(Style::default().fg(Color::Gray).bg(Color::Black))
+                .style(Style::default().fg(Color::Rgb(150, 142, 130)).bg(Color::Rgb(30, 30, 30)))  // Medium-bright grey with warm hint (number color) on sage background
                 .alignment(Alignment::Left);
             f.render_widget(status_bar, status_bar_area);
 
@@ -1744,23 +1776,23 @@ fn run_app<B: ratatui::backend::Backend>(
                         let masked_password = "*".repeat(password.len());
                         let text = format!("{}\n{}", prompt, masked_password);
                         let para = Paragraph::new(text)
-                            .block(Block::default().borders(Borders::ALL).title("Password Required"))
-                            .style(Style::default().fg(Color::Yellow))
+                            .block(Block::default().title("Password Required"))
+                            .style(Style::default().fg(Color::Rgb(175, 167, 150)))  // Brightest grey with warm hint (function color)
                             .wrap(Wrap { trim: false });
                         f.render_widget(para, chunks[2]);
                     }
                     UIMode::StatusMessage { message } => {
                         let para = Paragraph::new(message.as_str())
-                            .block(Block::default().borders(Borders::ALL).title("Status"))
-                            .style(Style::default().fg(Color::Cyan))
+                            .block(Block::default().title("Status"))
+                            .style(Style::default().fg(Color::Rgb(170, 160, 145)))  // Lighter grey with warm hint
                             .alignment(Alignment::Left);
                         f.render_widget(para, chunks[2]);
                     }
                     UIMode::ConfirmDelete { items } => {
                         let text = format!("Delete {} item(s)? (y/n)", items.len());
                         let para = Paragraph::new(text)
-                            .block(Block::default().borders(Borders::ALL).title("Confirm Delete"))
-                            .style(Style::default().fg(Color::Red))
+                            .block(Block::default().title("Confirm Delete"))
+                            .style(Style::default().fg(Color::Rgb(145, 135, 125)))  // Medium-bright grey with warm hint (decorator color)
                             .alignment(Alignment::Left);
                         f.render_widget(para, chunks[2]);
                     }
@@ -1781,14 +1813,14 @@ fn run_app<B: ratatui::backend::Backend>(
                             let is_cursor = i == *cursor_pos;
 
                             let style = if is_cursor && is_selected {
-                                // Cursor on selected text - use inverted selection colors
-                                Style::default().bg(Color::White).fg(Color::Blue)
+                                // Cursor on selected text
+                                Style::default().bg(Color::Rgb(165, 162, 157)).fg(Color::Rgb(160, 150, 135))
                             } else if is_cursor {
-                                // Cursor - use reverse video
-                                Style::default().bg(Color::Yellow).fg(Color::Black)
+                                // Cursor - use function color
+                                Style::default().bg(Color::Rgb(175, 167, 150)).fg(Color::Rgb(30, 30, 30))
                             } else if is_selected {
-                                // Selected text
-                                Style::default().bg(Color::Blue).fg(Color::White)
+                                // Selected text - use keyword color
+                                Style::default().bg(Color::Rgb(160, 150, 135)).fg(Color::Rgb(165, 162, 157))
                             } else {
                                 // Normal text
                                 Style::default()
@@ -1799,13 +1831,13 @@ fn run_app<B: ratatui::backend::Backend>(
 
                         // If cursor is at the end (past all characters), show a block cursor
                         if *cursor_pos >= new_name.len() {
-                            spans.push(Span::styled("█", Style::default().bg(Color::Yellow).fg(Color::Black)));
+                            spans.push(Span::styled("█", Style::default().bg(Color::Rgb(175, 167, 150)).fg(Color::Rgb(30, 30, 30))));
                         }
 
                         let text = Line::from(spans);
                         let para = Paragraph::new(text)
-                            .block(Block::default().borders(Borders::ALL).title("Rename"))
-                            .style(Style::default().fg(Color::Yellow))
+                            .block(Block::default().title("Rename"))
+                            .style(Style::default().fg(Color::Rgb(175, 167, 150)))  // Brightest grey with warm hint (function color)
                             .alignment(Alignment::Left);
                         f.render_widget(para, chunks[2]);
                     }
@@ -1821,8 +1853,8 @@ fn run_app<B: ratatui::backend::Backend>(
                             format!("Enter {} name: {}", type_str, name)
                         };
                         let para = Paragraph::new(text)
-                            .block(Block::default().borders(Borders::ALL).title("Create New"))
-                            .style(Style::default().fg(Color::Green))
+                            .block(Block::default().title("Create New"))
+                            .style(Style::default().fg(Color::Rgb(175, 167, 150)))  // Brightest grey with warm hint (function color)
                             .alignment(Alignment::Left);
                         f.render_widget(para, chunks[2]);
                     }
@@ -1872,10 +1904,9 @@ fn run_app<B: ratatui::backend::Backend>(
 
                 let para = Paragraph::new(help_text)
                     .block(Block::default()
-                        .borders(Borders::ALL)
                         .title("Help - Keyboard Shortcuts")
                         .title_alignment(Alignment::Center))
-                    .style(Style::default().fg(Color::White).bg(Color::Black))
+                    .style(Style::default().fg(Color::Rgb(165, 162, 157)).bg(Color::Rgb(30, 30, 30)))  // Bright neutral grey (normal text) on background
                     .alignment(Alignment::Left)
                     .wrap(Wrap { trim: false });
                 f.render_widget(para, area);
