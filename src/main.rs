@@ -148,6 +148,7 @@ struct FileExplorer {
     sort_mode: SortMode, // Current sort mode (by name or by date)
     terminal_width: usize, // Cached terminal width for rendering
     show_hidden: bool, // Whether to show hidden files/directories
+    status_message: Option<String>, // Temporary status message to show in status bar
 }
 
 impl FileExplorer {
@@ -180,6 +181,7 @@ impl FileExplorer {
             sort_mode: SortMode::Name,
             terminal_width: 100, // Default width, will be updated on first render
             show_hidden: false, // Hidden files/directories are hidden by default
+            status_message: None, // No status message initially
         };
         explorer.load_directory()?;
         Ok(explorer)
@@ -1498,10 +1500,11 @@ impl FileExplorer {
     }
 
     fn show_status(&mut self, message: String) {
-        self.ui_mode = UIMode::StatusMessage { message };
+        self.status_message = Some(message);
     }
 
     fn clear_status(&mut self) {
+        self.status_message = None;
         if matches!(self.ui_mode, UIMode::StatusMessage { .. }) {
             self.ui_mode = UIMode::Normal;
         }
@@ -1616,7 +1619,7 @@ fn run_app<B: ratatui::backend::Backend>(
             let area = f.area();
 
             let chunks = match &explorer.ui_mode {
-                UIMode::Normal => Layout::default()
+                UIMode::Normal | UIMode::StatusMessage { .. } => Layout::default()
                     .direction(Direction::Vertical)
                     .constraints([
                         Constraint::Min(3),
@@ -1747,22 +1750,28 @@ fn run_app<B: ratatui::backend::Backend>(
             f.render_stateful_widget(tree_list, main_area, &mut list_state);
 
             // Render status bar
-            let total_items = explorer.entries.len();
-            let selected_count = explorer.selected_indices.len();
-            let status_text = if selected_count > 0 {
-                let total_size = explorer.get_selected_total_size();
-                let size_str = FileExplorer::format_file_size(total_size);
-                format!("{} items | {} selected | {}", total_items, selected_count, size_str)
-            } else if let Some(entry) = explorer.entries.get(explorer.cursor_index) {
-                if entry.is_dir {
-                    format!("{} items | Directory: {}", total_items, entry.name)
-                } else {
-                    let item_size = explorer.current_item_size.unwrap_or(0);
-                    let size_str = FileExplorer::format_file_size(item_size);
-                    format!("{} items | File: {} | {}", total_items, entry.name, size_str)
-                }
+            let status_text = if let Some(ref msg) = explorer.status_message {
+                // Show status message if present
+                msg.clone()
             } else {
-                format!("{} items", total_items)
+                // Show normal status info
+                let total_items = explorer.entries.len();
+                let selected_count = explorer.selected_indices.len();
+                if selected_count > 0 {
+                    let total_size = explorer.get_selected_total_size();
+                    let size_str = FileExplorer::format_file_size(total_size);
+                    format!("{} items | {} selected | {}", total_items, selected_count, size_str)
+                } else if let Some(entry) = explorer.entries.get(explorer.cursor_index) {
+                    if entry.is_dir {
+                        format!("{} items | Directory: {}", total_items, entry.name)
+                    } else {
+                        let item_size = explorer.current_item_size.unwrap_or(0);
+                        let size_str = FileExplorer::format_file_size(item_size);
+                        format!("{} items | File: {} | {}", total_items, entry.name, size_str)
+                    }
+                } else {
+                    format!("{} items", total_items)
+                }
             };
 
             let status_bar = Paragraph::new(status_text)
@@ -1917,6 +1926,9 @@ fn run_app<B: ratatui::backend::Backend>(
             match event::read()? {
                 Event::Key(key) => {
                     // Auto-dismiss status messages on any key press and process the key
+                    if explorer.status_message.is_some() {
+                        explorer.status_message = None;
+                    }
                     if matches!(explorer.ui_mode, UIMode::StatusMessage { .. }) {
                         explorer.clear_status();
                     }
