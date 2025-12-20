@@ -17,6 +17,7 @@ use std::io::{self, Write};
 use std::path::PathBuf;
 use std::process::Command;
 use std::time::SystemTime;
+use std::os::unix::fs::PermissionsExt;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum SortMode {
@@ -30,6 +31,7 @@ struct DirEntry {
     name: String,
     is_dir: bool,
     modified: SystemTime,
+    permissions: u32, // Unix permission bits
 }
 
 #[derive(Clone, Debug)]
@@ -214,11 +216,15 @@ impl FileExplorer {
                         metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH)
                     };
 
+                    // Get permissions
+                    let permissions = metadata.permissions().mode();
+
                     entries.push(DirEntry {
                         path,
                         name,
                         is_dir,
                         modified,
+                        permissions,
                     });
                 }
             }
@@ -312,15 +318,17 @@ impl FileExplorer {
                     let is_last = i == self.entries.len() - 1;
                     let tree_char = if is_last { "└─" } else { "├─" };
                     let icon = if entry.is_dir { "" } else { "" };  // Nerd font folder and file icons
+                    let perms_str = Self::format_permissions(entry.permissions, entry.is_dir);
                     let date_str = Self::format_date(entry.modified);
+                    let timestamp_str = format!("{}   {}", perms_str, date_str);
 
                     // Check if this is a hidden file/directory (starts with .)
                     let is_hidden = entry.name.starts_with('.');
 
                     // Calculate available width for filename
-                    // Date format is "YYYY-MM-DD HH:mm" (16 chars)
-                    let date_width = 16;
-                    let buffer = 3; // Space between filename and date
+                    // Timestamp format is "drwxr-xr-x   YYYY-MM-DD HH:mm" (29 chars: 10 for perms + 3 spaces + 16 for date)
+                    let date_width = 29;
+                    let buffer = 1; // Space between filename and timestamp (reduced to move timestamp left)
 
                     // tree_char "├─" or "└─" is 2 chars
                     // icon "" or "" is 1 char + space = 2 chars
@@ -342,13 +350,13 @@ impl FileExplorer {
 
                     // Calculate padding to align date to the right
                     let content_len = prefix_len + display_name.chars().count();
-                    let padding_needed = terminal_width.saturating_sub(content_len + date_width); // No border anymore
+                    let padding_needed = terminal_width.saturating_sub(content_len + date_width + 2); // Subtract 2 extra to shift timestamp left
                     let padding = " ".repeat(padding_needed);
 
                     lines.push(TreeLine {
                         tree_prefix: format!("{}{} {} ", child_indent, tree_char, icon),
                         text: format!("{}{}", display_name, padding),
-                        timestamp: Some(date_str),
+                        timestamp: Some(timestamp_str),
                         entry_index: Some(i),
                         is_selected: self.selected_indices.contains(&i),
                         is_cursor: i == self.cursor_index,
@@ -1466,6 +1474,31 @@ impl FileExplorer {
         "Unknown         ".to_string()
     }
 
+    fn format_permissions(mode: u32, is_dir: bool) -> String {
+        // Format Unix permissions as a 10-character string like "drwxr-xr-x"
+        let file_type = if is_dir { 'd' } else { '-' };
+
+        // Owner permissions (bits 8-6)
+        let user_r = if mode & 0o400 != 0 { 'r' } else { '-' };
+        let user_w = if mode & 0o200 != 0 { 'w' } else { '-' };
+        let user_x = if mode & 0o100 != 0 { 'x' } else { '-' };
+
+        // Group permissions (bits 5-3)
+        let group_r = if mode & 0o040 != 0 { 'r' } else { '-' };
+        let group_w = if mode & 0o020 != 0 { 'w' } else { '-' };
+        let group_x = if mode & 0o010 != 0 { 'x' } else { '-' };
+
+        // Other permissions (bits 2-0)
+        let other_r = if mode & 0o004 != 0 { 'r' } else { '-' };
+        let other_w = if mode & 0o002 != 0 { 'w' } else { '-' };
+        let other_x = if mode & 0o001 != 0 { 'x' } else { '-' };
+
+        format!("{}{}{}{}{}{}{}{}{}{}",
+            file_type, user_r, user_w, user_x,
+            group_r, group_w, group_x,
+            other_r, other_w, other_x)
+    }
+
     fn get_file_size(path: &PathBuf) -> u64 {
         if let Ok(metadata) = fs::metadata(path) {
             if metadata.is_file() {
@@ -1619,7 +1652,7 @@ fn run_app<B: ratatui::backend::Backend>(
             let area = f.area();
 
             let chunks = match &explorer.ui_mode {
-                UIMode::Normal | UIMode::StatusMessage { .. } => Layout::default()
+                UIMode::Normal | UIMode::StatusMessage { .. } | UIMode::PasswordPrompt { .. } | UIMode::ConfirmDelete { .. } => Layout::default()
                     .direction(Direction::Vertical)
                     .constraints([
                         Constraint::Min(3),
@@ -1754,23 +1787,35 @@ fn run_app<B: ratatui::backend::Backend>(
                 // Show status message if present
                 msg.clone()
             } else {
-                // Show normal status info
-                let total_items = explorer.entries.len();
-                let selected_count = explorer.selected_indices.len();
-                if selected_count > 0 {
-                    let total_size = explorer.get_selected_total_size();
-                    let size_str = FileExplorer::format_file_size(total_size);
-                    format!("{} items | {} selected | {}", total_items, selected_count, size_str)
-                } else if let Some(entry) = explorer.entries.get(explorer.cursor_index) {
-                    if entry.is_dir {
-                        format!("{} items | Directory: {}", total_items, entry.name)
-                    } else {
-                        let item_size = explorer.current_item_size.unwrap_or(0);
-                        let size_str = FileExplorer::format_file_size(item_size);
-                        format!("{} items | File: {} | {}", total_items, entry.name, size_str)
+                // Check for UI mode-specific status bar content
+                match &explorer.ui_mode {
+                    UIMode::PasswordPrompt { prompt, password, .. } => {
+                        let masked_password = "*".repeat(password.len());
+                        format!("{} {}", prompt, masked_password)
                     }
-                } else {
-                    format!("{} items", total_items)
+                    UIMode::ConfirmDelete { items } => {
+                        format!("Delete {} item(s)? (y/n)", items.len())
+                    }
+                    _ => {
+                        // Show normal status info
+                        let total_items = explorer.entries.len();
+                        let selected_count = explorer.selected_indices.len();
+                        if selected_count > 0 {
+                            let total_size = explorer.get_selected_total_size();
+                            let size_str = FileExplorer::format_file_size(total_size);
+                            format!("{} items | {} selected | {}", total_items, selected_count, size_str)
+                        } else if let Some(entry) = explorer.entries.get(explorer.cursor_index) {
+                            if entry.is_dir {
+                                format!("{} items | Directory: {}", total_items, entry.name)
+                            } else {
+                                let item_size = explorer.current_item_size.unwrap_or(0);
+                                let size_str = FileExplorer::format_file_size(item_size);
+                                format!("{} items | File: {} | {}", total_items, entry.name, size_str)
+                            }
+                        } else {
+                            format!("{} items", total_items)
+                        }
+                    }
                 }
             };
 
@@ -2375,7 +2420,19 @@ fn run_app<B: ratatui::backend::Backend>(
                                     explorer.delete_selected();
                                 }
                                 KeyCode::Char('d') if ctrl => {
-                                    explorer.delete_selected();
+                                    // Copy full path to clipboard
+                                    if let Some(entry) = explorer.entries.get(explorer.cursor_index) {
+                                        let full_path = entry.path.display().to_string();
+                                        if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                                            if clipboard.set_text(&full_path).is_ok() {
+                                                explorer.show_status(format!("Copied path: {}", full_path));
+                                            } else {
+                                                explorer.show_status("Failed to copy path to clipboard".to_string());
+                                            }
+                                        } else {
+                                            explorer.show_status("Failed to access clipboard".to_string());
+                                        }
+                                    }
                                 }
                                 KeyCode::Char('z') if ctrl => {
                                     explorer.undo()?;
