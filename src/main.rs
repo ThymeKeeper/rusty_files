@@ -309,7 +309,7 @@ impl FileExplorer {
                 for (i, entry) in self.entries.iter().enumerate() {
                     let is_last = i == self.entries.len() - 1;
                     let tree_char = if is_last { "└─" } else { "├─" };
-                    let icon = if entry.is_dir { "" } else { "" };  // Nerd font folder and file icons
+                    let icon = if entry.is_dir { "" } else { "" };  // Nerd font folder and file icons
                     let date_str = Self::format_date(entry.modified);
 
                     // Check if this is a hidden file/directory (starts with .)
