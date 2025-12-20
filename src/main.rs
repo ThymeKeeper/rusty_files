@@ -339,7 +339,7 @@ impl FileExplorer {
                     // Available width for filename
                     let available_width = terminal_width.saturating_sub(prefix_len + date_width + buffer); // No border anymore
 
-                    // Truncate filename if needed
+                    // Truncate filename if needed and pad to fixed width
                     let display_name = if entry.name.chars().count() > available_width {
                         let truncate_at = available_width.saturating_sub(3); // Leave room for "..."
                         let truncated: String = entry.name.chars().take(truncate_at).collect();
@@ -348,10 +348,10 @@ impl FileExplorer {
                         entry.name.clone()
                     };
 
-                    // Calculate padding to align date to the right
-                    let content_len = prefix_len + display_name.chars().count();
-                    let padding_needed = terminal_width.saturating_sub(content_len + date_width + 2); // Subtract 2 extra to shift timestamp left
-                    let padding = " ".repeat(padding_needed);
+                    // Pad filename to fill available_width so timestamp stays at fixed position
+                    let name_len = display_name.chars().count();
+                    let padding_for_name = available_width.saturating_sub(name_len);
+                    let padding = " ".repeat(padding_for_name);
 
                     lines.push(TreeLine {
                         tree_prefix: format!("{}{} {} ", child_indent, tree_char, icon),
