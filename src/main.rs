@@ -101,6 +101,22 @@ enum UIMode {
         selection_start: Option<usize>,
     },
     Help,
+    FuzzyFind {
+        search_term: String,
+        matches: Vec<FuzzyMatch>,
+        selected_index: usize,
+    },
+}
+
+#[derive(Clone, Debug)]
+struct FuzzyMatch {
+    path: PathBuf,
+    display_path: String,  // Full path for display
+    name: String,  // Just the filename
+    is_dir: bool,
+    permissions: u32,  // Unix permission bits
+    score: i32,
+    matched_positions: Vec<usize>,  // Character positions that matched
 }
 
 #[derive(Clone, Debug)]
@@ -317,7 +333,7 @@ impl FileExplorer {
                 for (i, entry) in self.entries.iter().enumerate() {
                     let is_last = i == self.entries.len() - 1;
                     let tree_char = if is_last { "└─" } else { "├─" };
-                    let icon = if entry.is_dir { "" } else { "" };  // Nerd font folder and file icons
+                    let icon = Self::get_file_icon(&entry.name, entry.is_dir, entry.permissions);
                     let perms_str = Self::format_permissions(entry.permissions, entry.is_dir);
                     let date_str = Self::format_date(entry.modified);
                     let timestamp_str = format!("{}   {}", perms_str, date_str);
@@ -1474,6 +1490,81 @@ impl FileExplorer {
         "Unknown         ".to_string()
     }
 
+    fn get_file_icon(name: &str, is_dir: bool, permissions: u32) -> &'static str {
+        // Directories
+        if is_dir {
+            return "";
+        }
+
+        // Check if executable (any execute bit set)
+        let is_executable = permissions & 0o111 != 0;
+
+        // Get file extension
+        let extension = if let Some(pos) = name.rfind('.') {
+            &name[pos + 1..]
+        } else {
+            ""
+        };
+
+        // Check for specific filenames first
+        match name {
+            ".git" | ".gitignore" | ".gitmodules" | ".gitattributes" => return "",
+            "Cargo.toml" | "Cargo.lock" => return "",
+            "package.json" | "package-lock.json" => return "",
+            "README.md" | "readme.md" => return "",
+            "Makefile" | "makefile" => return "",
+            "Dockerfile" | "docker-compose.yml" => return "",
+            _ => {}
+        }
+
+        // Check by extension
+        match extension.to_lowercase().as_str() {
+            // Programming languages
+            "rs" => "",
+            "py" => "",
+            "js" | "jsx" | "mjs" => "",
+            "ts" | "tsx" => "",
+            "go" => "",
+            "c" | "h" => "",
+            "cpp" | "cc" | "cxx" | "hpp" => "",
+            "java" => "",
+            "rb" => "",
+            "php" => "",
+            "sh" | "bash" | "zsh" | "fish" => "",
+
+            // Markup/Data
+            "html" | "htm" => "",
+            "css" | "scss" | "sass" | "less" => "",
+            "json" => "",
+            "xml" => "",
+            "yaml" | "yml" => "",
+            "toml" => "",
+            "md" | "markdown" => "",
+
+            // Archives
+            "zip" | "tar" | "gz" | "bz2" | "xz" | "7z" | "rar" => "",
+
+            // Images
+            "png" | "jpg" | "jpeg" | "gif" | "bmp" | "svg" | "ico" => "",
+
+            // Documents
+            "pdf" => "",
+            "txt" => "",
+
+            // Executables/binaries
+            "exe" | "bin" | "out" => "",
+
+            // Default for unknown extensions
+            _ => {
+                if is_executable {
+                    ""  // Executable file
+                } else {
+                    ""  // Regular file
+                }
+            }
+        }
+    }
+
     fn format_permissions(mode: u32, is_dir: bool) -> String {
         // Format Unix permissions as a 10-character string like "drwxr-xr-x"
         let file_type = if is_dir { 'd' } else { '-' };
@@ -1497,6 +1588,155 @@ impl FileExplorer {
             file_type, user_r, user_w, user_x,
             group_r, group_w, group_x,
             other_r, other_w, other_x)
+    }
+
+    fn fuzzy_match(search: &str, target: &str) -> Option<(i32, Vec<usize>)> {
+        // Simple fuzzy matching: check if all characters in search appear in order in target
+        // Returns (score, matched_positions) or None if no match
+        let search_lower = search.to_lowercase();
+        let target_lower = target.to_lowercase();
+
+        if search_lower.is_empty() {
+            return Some((0, Vec::new()));
+        }
+
+        // First, check if search term appears as a complete substring
+        if let Some(start_pos) = target_lower.find(&search_lower) {
+            // Found as substring - give massive bonus
+            let matched_positions: Vec<usize> = (start_pos..start_pos + search_lower.len()).collect();
+            let mut score = 1000; // Huge base bonus for substring match
+
+            // Extra bonus if at word boundary or start
+            if start_pos == 0 {
+                score += 500; // At very start
+            } else if let Some(prev_char) = target_lower.chars().nth(start_pos - 1) {
+                if prev_char == '/' || prev_char == '_' || prev_char == '-' || prev_char == ' ' {
+                    score += 300; // At word boundary
+                }
+            }
+
+            // Bonus for shorter target (better match)
+            score += 100 - (target_lower.len() as i32 - search_lower.len() as i32);
+
+            return Some((score, matched_positions));
+        }
+
+        // Fall back to fuzzy matching if not found as substring
+        let mut search_chars = search_lower.chars();
+        let mut current_search = search_chars.next()?;
+        let mut last_match_pos = 0;
+        let mut score = 0;
+        let mut consecutive_matches = 0;
+        let mut matched_positions = Vec::new();
+
+        for (i, target_char) in target_lower.chars().enumerate() {
+            if target_char == current_search {
+                matched_positions.push(i);
+
+                // Bonus for consecutive matches
+                if i == last_match_pos + 1 {
+                    consecutive_matches += 1;
+                    score += 10 + consecutive_matches * 5;
+                } else {
+                    consecutive_matches = 0;
+                    score += 1;
+                }
+
+                // Bonus for matching at start
+                if i == 0 {
+                    score += 20;
+                }
+
+                last_match_pos = i;
+
+                if let Some(next) = search_chars.next() {
+                    current_search = next;
+                } else {
+                    // All search chars matched
+                    // Bonus for shorter strings (better match)
+                    score += 100 - (target_lower.len() as i32 - search_lower.len() as i32);
+                    return Some((score, matched_positions));
+                }
+            }
+        }
+
+        None // Not all search characters were found
+    }
+
+    fn search_directory_recursive(&self, dir: &PathBuf, max_depth: usize, current_depth: usize, results: &mut Vec<FuzzyMatch>, search_term: &str) {
+        if current_depth > max_depth {
+            return;
+        }
+
+        if let Ok(read_dir) = fs::read_dir(dir) {
+            for entry in read_dir.flatten() {
+                if let (Ok(name), Ok(metadata)) = (
+                    entry.file_name().into_string(),
+                    entry.metadata()
+                ) {
+                    // Skip hidden files if show_hidden is false
+                    if !self.show_hidden && name.starts_with('.') {
+                        continue;
+                    }
+
+                    let path = entry.path();
+                    let is_dir = metadata.is_dir();
+
+                    // Get permissions
+                    #[cfg(unix)]
+                    use std::os::unix::fs::PermissionsExt;
+                    #[cfg(unix)]
+                    let permissions = metadata.permissions().mode();
+                    #[cfg(not(unix))]
+                    let permissions = 0;
+
+                    // Get the display path (relative to current directory or absolute)
+                    let display_path = path.strip_prefix(&self.current_dir)
+                        .ok()
+                        .and_then(|p| p.to_str())
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| path.display().to_string());
+
+                    // Try to match against the full path
+                    if let Some((score, matched_positions)) = Self::fuzzy_match(search_term, &display_path) {
+                        results.push(FuzzyMatch {
+                            path: path.clone(),
+                            display_path,
+                            name: name.clone(),
+                            is_dir,
+                            permissions,
+                            score,
+                            matched_positions,
+                        });
+                    }
+
+                    // Recurse into directories
+                    if is_dir && current_depth < max_depth {
+                        self.search_directory_recursive(&path, max_depth, current_depth + 1, results, search_term);
+                    }
+                }
+            }
+        }
+    }
+
+    fn perform_fuzzy_search(&self, search_term: &str) -> Vec<FuzzyMatch> {
+        let mut results = Vec::new();
+
+        // Only search if term has at least 2 characters
+        if search_term.len() < 2 {
+            return results;
+        }
+
+        // Search current directory and up to 5 levels deep
+        self.search_directory_recursive(&self.current_dir, 5, 0, &mut results, search_term);
+
+        // Sort by score (highest first)
+        results.sort_by(|a, b| b.score.cmp(&a.score));
+
+        // Limit to top 20 results
+        results.truncate(20);
+
+        results
     }
 
     fn get_file_size(path: &PathBuf) -> u64 {
@@ -1679,10 +1919,142 @@ fn run_app<B: ratatui::backend::Backend>(
             // Update cached terminal width
             explorer.terminal_width = terminal_width;
 
-            let tree_lines = explorer.build_tree_lines(terminal_width);
-            explorer.calculate_scroll_offset(visible_height, &tree_lines);
+            // Check if we're in fuzzy find mode
+            let (tree_items, list_state, title) = if let UIMode::FuzzyFind { search_term, matches, selected_index } = &explorer.ui_mode {
+                // Render fuzzy find results (best match at bottom)
+                let fuzzy_items: Vec<ListItem> = matches
+                    .iter()
+                    .enumerate()
+                    .rev() // Reverse so best match is at bottom
+                    .map(|(idx, fuzzy_match)| {
+                        let is_selected = idx == *selected_index;
+                        let icon = FileExplorer::get_file_icon(&fuzzy_match.name, fuzzy_match.is_dir, fuzzy_match.permissions);
 
-            let tree_items: Vec<ListItem> = tree_lines
+                        // Build spans with highlighted matched characters
+                        let mut spans = vec![Span::raw(format!("{} ", icon))];
+
+                        let grey_color = Color::Rgb(120, 120, 117);  // Grey for non-matched
+                        let green_color = Color::Rgb(140, 180, 120); // Green for matched
+                        let bg_color = if is_selected { Some(Color::Rgb(50, 50, 50)) } else { None };
+
+                        let chars: Vec<char> = fuzzy_match.display_path.chars().collect();
+                        let mut last_pos = 0;
+
+                        for &match_pos in &fuzzy_match.matched_positions {
+                            // Add non-matched characters before this match
+                            if match_pos > last_pos {
+                                let non_matched: String = chars[last_pos..match_pos].iter().collect();
+                                let mut style = Style::default().fg(grey_color);
+                                if let Some(bg) = bg_color {
+                                    style = style.bg(bg);
+                                }
+                                spans.push(Span::styled(non_matched, style));
+                            }
+
+                            // Add matched character in green
+                            if match_pos < chars.len() {
+                                let matched_char = chars[match_pos].to_string();
+                                let mut style = Style::default().fg(green_color);
+                                if let Some(bg) = bg_color {
+                                    style = style.bg(bg);
+                                }
+                                if is_selected {
+                                    style = style.add_modifier(Modifier::BOLD);
+                                }
+                                spans.push(Span::styled(matched_char, style));
+                                last_pos = match_pos + 1;
+                            }
+                        }
+
+                        // Add remaining non-matched characters
+                        if last_pos < chars.len() {
+                            let remaining: String = chars[last_pos..].iter().collect();
+                            let mut style = Style::default().fg(grey_color);
+                            if let Some(bg) = bg_color {
+                                style = style.bg(bg);
+                            }
+                            spans.push(Span::styled(remaining, style));
+                        }
+
+                        // Right-align permissions with 1 char buffer from right edge
+                        let icon_width = 2; // Icon char + space
+                        let path_width = fuzzy_match.display_path.chars().count();
+                        let perms_width = 10; // "-rwxr-xr-x" is always 10 chars
+                        let buffer = 1;
+
+                        let used_width = icon_width + path_width + perms_width + buffer;
+                        let padding_needed = if terminal_width > used_width {
+                            terminal_width - used_width
+                        } else {
+                            1 // Minimum padding
+                        };
+
+                        // Add padding
+                        let mut padding_style = Style::default();
+                        if let Some(bg) = bg_color {
+                            padding_style = padding_style.bg(bg);
+                        }
+                        spans.push(Span::styled(" ".repeat(padding_needed), padding_style));
+
+                        // Add permissions
+                        let perms_str = FileExplorer::format_permissions(fuzzy_match.permissions, fuzzy_match.is_dir);
+                        let perm_color = Color::Rgb(120, 120, 117);  // Grey for permissions
+                        let mut perm_style = Style::default().fg(perm_color);
+                        if let Some(bg) = bg_color {
+                            perm_style = perm_style.bg(bg);
+                        }
+                        spans.push(Span::styled(perms_str, perm_style));
+
+                        ListItem::new(Line::from(spans))
+                    })
+                    .collect();
+
+                // Calculate which item should be selected (inverted because we reversed)
+                let visual_selected = if matches.is_empty() {
+                    None
+                } else {
+                    Some(matches.len() - 1 - selected_index)
+                };
+
+                // Calculate scroll offset to keep selected item in view with margin
+                let scroll_offset = if let Some(visual_pos) = visual_selected {
+                    let scrolloff = 3; // Margin from top/bottom
+
+                    if visible_height > 0 && matches.len() > visible_height {
+                        // Calculate offset to keep visual_pos within [scrolloff, visible_height - scrolloff - 1]
+                        let max_offset = matches.len().saturating_sub(visible_height);
+
+                        // Try to keep selected item at least scrolloff from edges
+                        if visual_pos < scrolloff {
+                            // Selected item is near the top of the list
+                            0
+                        } else if visual_pos + scrolloff >= matches.len() {
+                            // Selected item is near the bottom of the list
+                            max_offset
+                        } else {
+                            // Selected item is in the middle, center it with scrolloff margin
+                            let ideal_offset = visual_pos.saturating_sub(scrolloff);
+                            ideal_offset.min(max_offset)
+                        }
+                    } else {
+                        0
+                    }
+                } else {
+                    0
+                };
+
+                let list_state = ListState::default()
+                    .with_selected(visual_selected)
+                    .with_offset(scroll_offset);
+
+                let title = format!("Fuzzy Find: {} ({} matches)", search_term, matches.len());
+                (fuzzy_items, list_state, title)
+            } else {
+                // Normal tree view
+                let tree_lines = explorer.build_tree_lines(terminal_width);
+                explorer.calculate_scroll_offset(visible_height, &tree_lines);
+
+                let tree_items: Vec<ListItem> = tree_lines
                 .iter()
                 .map(|tree_line| {
                     // Determine base text color using sage's color scheme
@@ -1753,18 +2125,28 @@ fn run_app<B: ratatui::backend::Backend>(
 
                     // Build line with separate styling for tree prefix, text, and timestamp
                     let mut spans = vec![
-                        Span::styled(&tree_line.tree_prefix, tree_prefix_style),
-                        Span::styled(&tree_line.text, text_style)
+                        Span::styled(tree_line.tree_prefix.clone(), tree_prefix_style),
+                        Span::styled(tree_line.text.clone(), text_style)
                     ];
                     if let Some(timestamp) = &tree_line.timestamp {
-                        spans.push(Span::styled(timestamp, timestamp_style));
+                        spans.push(Span::styled(timestamp.clone(), timestamp_style));
                     }
 
                     ListItem::new(Line::from(spans))
                 })
                 .collect();
 
-            let current_dir_str = explorer.current_dir.display().to_string();
+                let cursor_line_idx = explorer.get_cursor_line_index(terminal_width);
+                let list_state = ListState::default()
+                    .with_selected(Some(cursor_line_idx))
+                    .with_offset(explorer.scroll_offset);
+
+                let current_dir_str = explorer.current_dir.display().to_string();
+                let title = format!("File Explorer: {}", current_dir_str);
+                (tree_items, list_state, title)
+            };
+
+            // Render the list with title
             let title_style = Style::default()
                 .fg(Color::Rgb(65, 65, 65))  // Very dark grey (comment color)
                 .add_modifier(Modifier::BOLD);
@@ -1772,14 +2154,10 @@ fn run_app<B: ratatui::backend::Backend>(
             let tree_list = List::new(tree_items)
                 .block(
                     Block::default()
-                        .title(Span::styled(format!("File Explorer: {}", current_dir_str), title_style))
+                        .title(Span::styled(title, title_style))
                 );
 
-            let cursor_line_idx = explorer.get_cursor_line_index(terminal_width);
-            let mut list_state = ListState::default()
-                .with_selected(Some(cursor_line_idx))
-                .with_offset(explorer.scroll_offset);
-
+            let mut list_state = list_state;
             f.render_stateful_widget(tree_list, main_area, &mut list_state);
 
             // Render status bar
@@ -1795,6 +2173,9 @@ fn run_app<B: ratatui::backend::Backend>(
                     }
                     UIMode::ConfirmDelete { items } => {
                         format!("Delete {} item(s)? (y/n)", items.len())
+                    }
+                    UIMode::FuzzyFind { search_term, matches, .. } => {
+                        format!("Find: {} ({} matches)", search_term, matches.len())
                     }
                     _ => {
                         // Show normal status info
@@ -2380,6 +2761,116 @@ fn run_app<B: ratatui::backend::Backend>(
                                 _ => {}
                             }
                         }
+                        UIMode::FuzzyFind { .. } => {
+                            match key.code {
+                                KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                    // Copy full path of selected match to clipboard
+                                    if let UIMode::FuzzyFind { matches, selected_index, .. } = &explorer.ui_mode {
+                                        if let Some(selected) = matches.get(*selected_index) {
+                                            let full_path = selected.path.display().to_string();
+                                            if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                                                if clipboard.set_text(&full_path).is_ok() {
+                                                    explorer.show_status(format!("Copied path: {}", full_path));
+                                                } else {
+                                                    explorer.show_status("Failed to copy path to clipboard".to_string());
+                                                }
+                                            } else {
+                                                explorer.show_status("Failed to access clipboard".to_string());
+                                            }
+                                        }
+                                    }
+                                }
+                                KeyCode::Char(c) => {
+                                    // Add character to search term
+                                    let search_term_clone = if let UIMode::FuzzyFind { search_term, .. } = &mut explorer.ui_mode {
+                                        search_term.push(c);
+                                        Some(search_term.clone())
+                                    } else {
+                                        None
+                                    };
+                                    // Perform search with cloned term
+                                    if let Some(term) = search_term_clone {
+                                        let new_matches = explorer.perform_fuzzy_search(&term);
+                                        if let UIMode::FuzzyFind { matches, selected_index, .. } = &mut explorer.ui_mode {
+                                            *matches = new_matches;
+                                            *selected_index = 0;
+                                        }
+                                    }
+                                }
+                                KeyCode::Backspace => {
+                                    // Remove last character
+                                    let search_term_clone = if let UIMode::FuzzyFind { search_term, .. } = &mut explorer.ui_mode {
+                                        search_term.pop();
+                                        Some(search_term.clone())
+                                    } else {
+                                        None
+                                    };
+                                    // Perform search with cloned term
+                                    if let Some(term) = search_term_clone {
+                                        let new_matches = explorer.perform_fuzzy_search(&term);
+                                        if let UIMode::FuzzyFind { matches, selected_index, .. } = &mut explorer.ui_mode {
+                                            *matches = new_matches;
+                                            *selected_index = 0;
+                                        }
+                                    }
+                                }
+                                KeyCode::Up => {
+                                    // Move selection up visually (worse matches)
+                                    if let UIMode::FuzzyFind { matches, selected_index, .. } = &mut explorer.ui_mode {
+                                        if *selected_index + 1 < matches.len() {
+                                            *selected_index += 1;
+                                        }
+                                    }
+                                }
+                                KeyCode::Down => {
+                                    // Move selection down visually (better matches)
+                                    if let UIMode::FuzzyFind { selected_index, .. } = &mut explorer.ui_mode {
+                                        if *selected_index > 0 {
+                                            *selected_index -= 1;
+                                        }
+                                    }
+                                }
+                                KeyCode::Enter => {
+                                    // Navigate to selected match
+                                    if let UIMode::FuzzyFind { matches, selected_index, .. } = &explorer.ui_mode {
+                                        if let Some(selected) = matches.get(*selected_index) {
+                                            let path = selected.path.clone();
+                                            let is_dir = selected.is_dir;
+                                            explorer.ui_mode = UIMode::Normal;
+
+                                            if is_dir {
+                                                // If it's a directory, enter it
+                                                explorer.current_dir = path;
+                                                explorer.load_directory()?;
+                                            } else {
+                                                // If it's a file, navigate to parent and select the file
+                                                if let Some(parent) = path.parent() {
+                                                    explorer.current_dir = parent.to_path_buf();
+                                                    explorer.load_directory()?;
+
+                                                    // Find and select the item
+                                                    if let Some(file_name) = path.file_name() {
+                                                        if let Some(name_str) = file_name.to_str() {
+                                                            for (i, entry) in explorer.entries.iter().enumerate() {
+                                                                if entry.name == name_str {
+                                                                    explorer.cursor_index = i;
+                                                                    break;
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                KeyCode::Esc => {
+                                    // Exit fuzzy find mode
+                                    explorer.ui_mode = UIMode::Normal;
+                                }
+                                _ => {}
+                            }
+                        }
                         UIMode::Normal | UIMode::StatusMessage { .. } => {
                             let shift = key.modifiers.contains(KeyModifiers::SHIFT);
                             let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
@@ -2442,6 +2933,14 @@ fn run_app<B: ratatui::backend::Backend>(
                                 }
                                 KeyCode::Char('h') if ctrl => {
                                     explorer.toggle_hidden()?;
+                                }
+                                KeyCode::Char('f') if ctrl => {
+                                    // Enter fuzzy find mode
+                                    explorer.ui_mode = UIMode::FuzzyFind {
+                                        search_term: String::new(),
+                                        matches: Vec::new(),
+                                        selected_index: 0,
+                                    };
                                 }
                                 _ => {}
                             }
