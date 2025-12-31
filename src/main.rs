@@ -16,8 +16,11 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::process::Command;
-use std::time::SystemTime;
+use std::time::{SystemTime, Instant};
 use std::os::unix::fs::PermissionsExt;
+use std::sync::mpsc::{self, Receiver};
+use std::sync::Arc;
+use std::thread;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum SortMode {
@@ -105,7 +108,17 @@ enum UIMode {
         search_term: String,
         matches: Vec<FuzzyMatch>,
         selected_index: usize,
+        file_cache: Arc<Vec<CachedFile>>,  // Pre-built list of all files to search (Arc = cheap to clone)
     },
+}
+
+#[derive(Clone, Debug)]
+struct CachedFile {
+    path: PathBuf,
+    display_path: String,
+    name: String,
+    is_dir: bool,
+    permissions: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -167,6 +180,8 @@ struct FileExplorer {
     terminal_width: usize, // Cached terminal width for rendering
     show_hidden: bool, // Whether to show hidden files/directories
     status_message: Option<String>, // Temporary status message to show in status bar
+    status_message_time: Option<std::time::Instant>, // When the status message was set
+    fuzzy_cache: Arc<Vec<CachedFile>>, // Persistent cache for fuzzy find (built on startup)
 }
 
 impl FileExplorer {
@@ -200,6 +215,8 @@ impl FileExplorer {
             terminal_width: 100, // Default width, will be updated on first render
             show_hidden: false, // Hidden files/directories are hidden by default
             status_message: None, // No status message initially
+            status_message_time: None, // No status message timestamp initially
+            fuzzy_cache: Arc::new(Vec::new()), // Start with empty cache, will be built in background
         };
         explorer.load_directory()?;
         Ok(explorer)
@@ -1590,47 +1607,51 @@ impl FileExplorer {
             other_r, other_w, other_x)
     }
 
-    fn fuzzy_match(search: &str, target: &str) -> Option<(i32, Vec<usize>)> {
-        // Simple fuzzy matching: check if all characters in search appear in order in target
+    fn fuzzy_match_with_lower(search_lower: &str, target: &str) -> Option<(i32, Vec<usize>)> {
+        // Optimized fuzzy matching with pre-lowercased search term
         // Returns (score, matched_positions) or None if no match
-        let search_lower = search.to_lowercase();
-        let target_lower = target.to_lowercase();
 
         if search_lower.is_empty() {
             return Some((0, Vec::new()));
         }
 
-        // First, check if search term appears as a complete substring
-        if let Some(start_pos) = target_lower.find(&search_lower) {
+        // Collect target chars once for efficient indexed access
+        let target_chars: Vec<char> = target.chars().collect();
+        let search_chars: Vec<char> = search_lower.chars().collect();
+
+        // First, try to find as substring (most common case)
+        if let Some(start_pos) = Self::case_insensitive_find(&target_chars, &search_chars) {
             // Found as substring - give massive bonus
-            let matched_positions: Vec<usize> = (start_pos..start_pos + search_lower.len()).collect();
+            let matched_positions: Vec<usize> = (start_pos..start_pos + search_chars.len()).collect();
             let mut score = 1000; // Huge base bonus for substring match
 
             // Extra bonus if at word boundary or start
             if start_pos == 0 {
                 score += 500; // At very start
-            } else if let Some(prev_char) = target_lower.chars().nth(start_pos - 1) {
+            } else if start_pos > 0 {
+                let prev_char = target_chars[start_pos - 1];
                 if prev_char == '/' || prev_char == '_' || prev_char == '-' || prev_char == ' ' {
                     score += 300; // At word boundary
                 }
             }
 
             // Bonus for shorter target (better match)
-            score += 100 - (target_lower.len() as i32 - search_lower.len() as i32);
+            score += 100 - (target_chars.len() as i32 - search_chars.len() as i32);
 
             return Some((score, matched_positions));
         }
 
         // Fall back to fuzzy matching if not found as substring
-        let mut search_chars = search_lower.chars();
-        let mut current_search = search_chars.next()?;
+        let mut search_idx = 0;
+        let mut current_search = search_chars[search_idx];
         let mut last_match_pos = 0;
         let mut score = 0;
         let mut consecutive_matches = 0;
         let mut matched_positions = Vec::new();
 
-        for (i, target_char) in target_lower.chars().enumerate() {
-            if target_char == current_search {
+        for (i, &target_char) in target_chars.iter().enumerate() {
+            let target_lower = target_char.to_lowercase().next().unwrap_or(target_char);
+            if target_lower == current_search {
                 matched_positions.push(i);
 
                 // Bonus for consecutive matches
@@ -1649,12 +1670,13 @@ impl FileExplorer {
 
                 last_match_pos = i;
 
-                if let Some(next) = search_chars.next() {
-                    current_search = next;
+                search_idx += 1;
+                if search_idx < search_chars.len() {
+                    current_search = search_chars[search_idx];
                 } else {
                     // All search chars matched
                     // Bonus for shorter strings (better match)
-                    score += 100 - (target_lower.len() as i32 - search_lower.len() as i32);
+                    score += 100 - (target_chars.len() as i32 - search_chars.len() as i32);
                     return Some((score, matched_positions));
                 }
             }
@@ -1663,6 +1685,111 @@ impl FileExplorer {
         None // Not all search characters were found
     }
 
+    fn case_insensitive_find(target: &[char], search: &[char]) -> Option<usize> {
+        // Fast case-insensitive substring search
+        if search.is_empty() || target.len() < search.len() {
+            return None;
+        }
+
+        'outer: for i in 0..=target.len() - search.len() {
+            for j in 0..search.len() {
+                let target_lower = target[i + j].to_lowercase().next().unwrap_or(target[i + j]);
+                if target_lower != search[j] {
+                    continue 'outer;
+                }
+            }
+            return Some(i);
+        }
+        None
+    }
+
+    fn build_file_cache(&self, dir: &PathBuf, max_depth: Option<usize>, current_depth: usize, cache: &mut Vec<CachedFile>) {
+        build_file_cache_static(dir, max_depth, current_depth, cache, self.show_hidden);
+    }
+}
+
+// Static version for background thread using ignore crate
+fn build_file_cache_static(dir: &PathBuf, max_depth: Option<usize>, _current_depth: usize, cache: &mut Vec<CachedFile>, show_hidden: bool) {
+    use ignore::WalkBuilder;
+    use ignore::overrides::OverrideBuilder;
+
+    // Build override patterns for common bloat directories (not including target - let .gitignore handle it)
+    let mut override_builder = OverrideBuilder::new(dir);
+    override_builder.add("!node_modules/").ok();
+    override_builder.add("!dist/").ok();
+    override_builder.add("!build/").ok();
+    override_builder.add("!out/").ok();
+    override_builder.add("!__pycache__/").ok();
+    override_builder.add("!.pytest_cache/").ok();
+    override_builder.add("!.venv/").ok();
+    override_builder.add("!venv/").ok();
+    override_builder.add("!env/").ok();
+    override_builder.add("!.next/").ok();
+    override_builder.add("!.nuxt/").ok();
+
+    let overrides = override_builder.build().ok();
+
+    // Create walker that respects .gitignore
+    let mut walker = WalkBuilder::new(dir);
+    walker
+        .max_depth(max_depth)     // None = unlimited depth
+        .hidden(!show_hidden)     // Skip hidden files unless show_hidden is true
+        .git_ignore(true)         // Respect .gitignore
+        .git_global(true)         // Respect global gitignore
+        .git_exclude(true)        // Respect .git/info/exclude
+        .follow_links(false)      // Don't follow symlinks (avoid loops/slowness)
+        .same_file_system(true)   // Don't cross filesystem boundaries (avoid network mounts)
+        .threads(4);              // Use 4 threads for parallel scanning
+
+    if let Some(overrides) = overrides {
+        walker.overrides(overrides);
+    }
+
+    // Walk the directory tree
+    for result in walker.build() {
+        if let Ok(entry) = result {
+            let path = entry.path();
+
+            // Skip the base directory itself
+            if path == dir {
+                continue;
+            }
+
+            if let (Some(name), Ok(metadata)) = (
+                path.file_name().and_then(|n| n.to_str()).map(|s| s.to_string()),
+                entry.metadata()
+            ) {
+                let is_dir = metadata.is_dir();
+
+                // Get permissions
+                #[cfg(unix)]
+                use std::os::unix::fs::PermissionsExt;
+                #[cfg(unix)]
+                let permissions = metadata.permissions().mode();
+                #[cfg(not(unix))]
+                let permissions = 0;
+
+                // Get the display path (relative to base directory)
+                let display_path = path.strip_prefix(dir)
+                    .ok()
+                    .and_then(|p| p.to_str())
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| path.display().to_string());
+
+                // Add to cache
+                cache.push(CachedFile {
+                    path: path.to_path_buf(),
+                    display_path,
+                    name,
+                    is_dir,
+                    permissions,
+                });
+            }
+        }
+    }
+}
+
+impl FileExplorer {
     fn search_directory_recursive(&self, dir: &PathBuf, max_depth: usize, current_depth: usize, results: &mut Vec<FuzzyMatch>, search_term: &str) {
         if current_depth > max_depth {
             return;
@@ -1698,7 +1825,8 @@ impl FileExplorer {
                         .unwrap_or_else(|| path.display().to_string());
 
                     // Try to match against the full path
-                    if let Some((score, matched_positions)) = Self::fuzzy_match(search_term, &display_path) {
+                    let search_lower = search_term.to_lowercase();
+                    if let Some((score, matched_positions)) = Self::fuzzy_match_with_lower(&search_lower, &display_path) {
                         results.push(FuzzyMatch {
                             path: path.clone(),
                             display_path,
@@ -1719,21 +1847,43 @@ impl FileExplorer {
         }
     }
 
-    fn perform_fuzzy_search(&self, search_term: &str) -> Vec<FuzzyMatch> {
-        let mut results = Vec::new();
-
+    fn perform_fuzzy_search(&self, search_term: &str, file_cache: &Arc<Vec<CachedFile>>) -> Vec<FuzzyMatch> {
         // Only search if term has at least 2 characters
         if search_term.len() < 2 {
-            return results;
+            return Vec::new();
         }
 
-        // Search current directory and up to 5 levels deep
-        self.search_directory_recursive(&self.current_dir, 5, 0, &mut results, search_term);
+        // Convert search term to lowercase ONCE instead of for every file
+        let search_lower = search_term.to_lowercase();
 
-        // Sort by score (highest first)
-        results.sort_by(|a, b| b.score.cmp(&a.score));
+        // Pre-allocate with reasonable capacity
+        let mut results = Vec::with_capacity(100);
 
-        // Limit to top 20 results
+        // Early termination: stop after finding enough matches to sort through
+        const MAX_RESULTS_BEFORE_SORT: usize = 200;
+
+        // Search the cached file list
+        for cached_file in file_cache.iter() {
+            if let Some((score, matched_positions)) = Self::fuzzy_match_with_lower(&search_lower, &cached_file.display_path) {
+                results.push(FuzzyMatch {
+                    path: cached_file.path.clone(),
+                    display_path: cached_file.display_path.clone(),
+                    name: cached_file.name.clone(),
+                    is_dir: cached_file.is_dir,
+                    permissions: cached_file.permissions,
+                    score,
+                    matched_positions,
+                });
+
+                // Early exit if we have enough matches
+                if results.len() >= MAX_RESULTS_BEFORE_SORT {
+                    break;
+                }
+            }
+        }
+
+        // Sort by score (highest first) and limit to top 20
+        results.sort_unstable_by(|a, b| b.score.cmp(&a.score));
         results.truncate(20);
 
         results
@@ -1774,10 +1924,12 @@ impl FileExplorer {
 
     fn show_status(&mut self, message: String) {
         self.status_message = Some(message);
+        self.status_message_time = Some(std::time::Instant::now());
     }
 
     fn clear_status(&mut self) {
         self.status_message = None;
+        self.status_message_time = None;
         if matches!(self.ui_mode, UIMode::StatusMessage { .. }) {
             self.ui_mode = UIMode::Normal;
         }
@@ -1887,7 +2039,86 @@ fn run_app<B: ratatui::backend::Backend>(
     terminal: &mut Terminal<B>,
     mut explorer: FileExplorer,
 ) -> io::Result<()> {
+    let mut cache_receiver: Option<Receiver<Arc<Vec<CachedFile>>>> = None;
+
+    // Debouncing for fuzzy find search
+    let mut last_search_update: Option<Instant> = None;
+    let mut pending_search: bool = false;
+    let debounce_ms = 150; // Wait 150ms after last keystroke before searching
+
+    // Build initial fuzzy cache on startup in background from root
+    {
+        let (sender, receiver) = mpsc::channel();
+        let cache_dir = PathBuf::from("/");  // Cache from root!
+        let show_hidden = explorer.show_hidden;
+
+        thread::spawn(move || {
+            let mut file_cache = Vec::new();
+            build_file_cache_static(&cache_dir, None, 0, &mut file_cache, show_hidden);
+            let _ = sender.send(Arc::new(file_cache));
+        });
+
+        cache_receiver = Some(receiver);
+    }
+
     loop {
+        // Check if cache is ready from background thread
+        if let Some(ref receiver) = cache_receiver {
+            if let Ok(file_cache) = receiver.try_recv() {
+                // Cache is ready! Store it in the persistent cache
+                explorer.fuzzy_cache = file_cache.clone();
+
+                // If we're currently in fuzzy find mode, update it and re-run search
+                let (search_term_clone, should_search) = if let UIMode::FuzzyFind { search_term, file_cache: cache, .. } = &mut explorer.ui_mode {
+                    *cache = file_cache.clone();  // Arc clone is cheap!
+                    (Some(search_term.clone()), true)
+                } else {
+                    (None, false)
+                };
+
+                // Re-run search with the now-populated cache
+                if should_search {
+                    if let Some(term) = search_term_clone {
+                        let new_matches = explorer.perform_fuzzy_search(&term, &file_cache);
+                        if let UIMode::FuzzyFind { matches, selected_index, .. } = &mut explorer.ui_mode {
+                            *matches = new_matches;
+                            *selected_index = 0;
+                        }
+                    }
+                }
+
+                // Clear receiver since we got the cache
+                cache_receiver = None;
+            }
+        }
+
+        // Debounced fuzzy find search
+        if pending_search {
+            if let Some(last_update) = last_search_update {
+                let elapsed = last_update.elapsed().as_millis();
+                if elapsed >= debounce_ms as u128 {
+                    // Enough time has passed, perform the search
+                    let (search_term_clone, cache_clone) = if let UIMode::FuzzyFind { search_term, file_cache, .. } = &explorer.ui_mode {
+                        (Some(search_term.clone()), file_cache.clone())
+                    } else {
+                        (None, Arc::new(Vec::new()))
+                    };
+
+                    if let Some(term) = search_term_clone {
+                        let new_matches = explorer.perform_fuzzy_search(&term, &cache_clone);
+                        if let UIMode::FuzzyFind { matches, selected_index, .. } = &mut explorer.ui_mode {
+                            *matches = new_matches;
+                            *selected_index = 0;
+                        }
+                    }
+
+                    // Clear pending search flag
+                    pending_search = false;
+                    last_search_update = None;
+                }
+            }
+        }
+
         terminal.draw(|f| {
             let area = f.area();
 
@@ -1920,9 +2151,18 @@ fn run_app<B: ratatui::backend::Backend>(
             explorer.terminal_width = terminal_width;
 
             // Check if we're in fuzzy find mode
-            let (tree_items, list_state, title) = if let UIMode::FuzzyFind { search_term, matches, selected_index } = &explorer.ui_mode {
+            let (tree_items, list_state, title) = if let UIMode::FuzzyFind { search_term, matches, selected_index, file_cache } = &explorer.ui_mode {
+                // Check if cache is still building
+                let cache_building = file_cache.is_empty() && explorer.fuzzy_cache.is_empty();
+
                 // Render fuzzy find results (best match at bottom)
-                let fuzzy_items: Vec<ListItem> = matches
+                let fuzzy_items: Vec<ListItem> = if cache_building {
+                    // Show "building cache" message
+                    vec![ListItem::new(Line::from(vec![
+                        Span::styled("Building file cache, please wait...", Style::default().fg(Color::Rgb(140, 180, 120)))
+                    ]))]
+                } else {
+                    matches
                     .iter()
                     .enumerate()
                     .rev() // Reverse so best match is at bottom
@@ -2007,10 +2247,11 @@ fn run_app<B: ratatui::backend::Backend>(
 
                         ListItem::new(Line::from(spans))
                     })
-                    .collect();
+                    .collect()
+                };
 
                 // Calculate which item should be selected (inverted because we reversed)
-                let visual_selected = if matches.is_empty() {
+                let visual_selected = if cache_building || matches.is_empty() {
                     None
                 } else {
                     Some(matches.len() - 1 - selected_index)
@@ -2047,7 +2288,11 @@ fn run_app<B: ratatui::backend::Backend>(
                     .with_selected(visual_selected)
                     .with_offset(scroll_offset);
 
-                let title = format!("Fuzzy Find: {} ({} matches)", search_term, matches.len());
+                let title = if cache_building {
+                    format!("Fuzzy Find: {} (building cache...)", search_term)
+                } else {
+                    format!("Fuzzy Find: {} ({} matches)", search_term, matches.len())
+                };
                 (fuzzy_items, list_state, title)
             } else {
                 // Normal tree view
@@ -2174,8 +2419,8 @@ fn run_app<B: ratatui::backend::Backend>(
                     UIMode::ConfirmDelete { items } => {
                         format!("Delete {} item(s)? (y/n)", items.len())
                     }
-                    UIMode::FuzzyFind { search_term, matches, .. } => {
-                        format!("Find: {} ({} matches)", search_term, matches.len())
+                    UIMode::FuzzyFind { search_term, matches, file_cache, .. } => {
+                        format!("Find: {} ({} matches | {} files cached)", search_term, matches.len(), file_cache.len())
                     }
                     _ => {
                         // Show normal status info
@@ -2331,6 +2576,7 @@ fn run_app<B: ratatui::backend::Backend>(
                     "  Ctrl+L         - Refresh display",
                     "",
                     "Other:",
+                    "  Ctrl+T         - Open terminal at current directory",
                     "  F1             - Show/hide this help",
                     "  Ctrl+Q         - Quit",
                     "",
@@ -2348,12 +2594,20 @@ fn run_app<B: ratatui::backend::Backend>(
             }
         })?;
 
+        // Auto-dismiss status messages after 3 seconds
+        if let Some(time) = explorer.status_message_time {
+            if time.elapsed() > std::time::Duration::from_secs(3) {
+                explorer.clear_status();
+            }
+        }
+
         if event::poll(std::time::Duration::from_millis(100))? {
             match event::read()? {
                 Event::Key(key) => {
                     // Auto-dismiss status messages on any key press and process the key
                     if explorer.status_message.is_some() {
                         explorer.status_message = None;
+                        explorer.status_message_time = None;
                     }
                     if matches!(explorer.ui_mode, UIMode::StatusMessage { .. }) {
                         explorer.clear_status();
@@ -2763,6 +3017,10 @@ fn run_app<B: ratatui::backend::Backend>(
                         }
                         UIMode::FuzzyFind { .. } => {
                             match key.code {
+                                KeyCode::Char('q') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                    // Quit the program
+                                    return Ok(());
+                                }
                                 KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                                     // Copy full path of selected match to clipboard
                                     if let UIMode::FuzzyFind { matches, selected_index, .. } = &explorer.ui_mode {
@@ -2782,36 +3040,20 @@ fn run_app<B: ratatui::backend::Backend>(
                                 }
                                 KeyCode::Char(c) => {
                                     // Add character to search term
-                                    let search_term_clone = if let UIMode::FuzzyFind { search_term, .. } = &mut explorer.ui_mode {
+                                    if let UIMode::FuzzyFind { search_term, .. } = &mut explorer.ui_mode {
                                         search_term.push(c);
-                                        Some(search_term.clone())
-                                    } else {
-                                        None
-                                    };
-                                    // Perform search with cloned term
-                                    if let Some(term) = search_term_clone {
-                                        let new_matches = explorer.perform_fuzzy_search(&term);
-                                        if let UIMode::FuzzyFind { matches, selected_index, .. } = &mut explorer.ui_mode {
-                                            *matches = new_matches;
-                                            *selected_index = 0;
-                                        }
+                                        // Mark that we have a pending search (debounced)
+                                        pending_search = true;
+                                        last_search_update = Some(Instant::now());
                                     }
                                 }
                                 KeyCode::Backspace => {
                                     // Remove last character
-                                    let search_term_clone = if let UIMode::FuzzyFind { search_term, .. } = &mut explorer.ui_mode {
+                                    if let UIMode::FuzzyFind { search_term, .. } = &mut explorer.ui_mode {
                                         search_term.pop();
-                                        Some(search_term.clone())
-                                    } else {
-                                        None
-                                    };
-                                    // Perform search with cloned term
-                                    if let Some(term) = search_term_clone {
-                                        let new_matches = explorer.perform_fuzzy_search(&term);
-                                        if let UIMode::FuzzyFind { matches, selected_index, .. } = &mut explorer.ui_mode {
-                                            *matches = new_matches;
-                                            *selected_index = 0;
-                                        }
+                                        // Mark that we have a pending search (debounced)
+                                        pending_search = true;
+                                        last_search_update = Some(Instant::now());
                                     }
                                 }
                                 KeyCode::Up => {
@@ -2837,6 +3079,9 @@ fn run_app<B: ratatui::backend::Backend>(
                                             let path = selected.path.clone();
                                             let is_dir = selected.is_dir;
                                             explorer.ui_mode = UIMode::Normal;
+                                            // Clear debounce state
+                                            pending_search = false;
+                                            last_search_update = None;
 
                                             if is_dir {
                                                 // If it's a directory, enter it
@@ -2867,6 +3112,9 @@ fn run_app<B: ratatui::backend::Backend>(
                                 KeyCode::Esc => {
                                     // Exit fuzzy find mode
                                     explorer.ui_mode = UIMode::Normal;
+                                    // Clear debounce state
+                                    pending_search = false;
+                                    last_search_update = None;
                                 }
                                 _ => {}
                             }
@@ -2883,6 +3131,27 @@ fn run_app<B: ratatui::backend::Backend>(
                                 KeyCode::Char('l') if ctrl => {
                                     // Ctrl+L: Refresh/clear terminal display
                                     terminal.clear()?;
+                                }
+                                KeyCode::Char('t') if ctrl => {
+                                    // Ctrl+T: Open terminal at current directory
+                                    let dir = explorer.current_dir.clone();
+                                    // Check $TERMINAL env var first, fall back to kitty
+                                    let terminal = std::env::var("TERMINAL")
+                                        .unwrap_or_else(|_| "kitty".to_string());
+
+                                    match std::process::Command::new(&terminal)
+                                        .current_dir(&dir)
+                                        .stdout(std::process::Stdio::null())
+                                        .stderr(std::process::Stdio::null())
+                                        .spawn()
+                                    {
+                                        Ok(_) => {
+                                            explorer.show_status(format!("Opened {} terminal", terminal));
+                                        }
+                                        Err(e) => {
+                                            explorer.show_status(format!("Failed to open terminal: {}", e));
+                                        }
+                                    }
                                 }
                                 KeyCode::Up => explorer.move_up(shift),
                                 KeyCode::Down => explorer.move_down(shift),
@@ -2935,12 +3204,29 @@ fn run_app<B: ratatui::backend::Backend>(
                                     explorer.toggle_hidden()?;
                                 }
                                 KeyCode::Char('f') if ctrl => {
-                                    // Enter fuzzy find mode
+                                    // Filter cache to current directory only (much faster searching!)
+                                    let filtered_cache: Vec<CachedFile> = explorer.fuzzy_cache
+                                        .iter()
+                                        .filter(|f| f.path.starts_with(&explorer.current_dir))
+                                        .cloned()
+                                        .collect();
+
+                                    // Enter fuzzy find mode with filtered cache
                                     explorer.ui_mode = UIMode::FuzzyFind {
                                         search_term: String::new(),
                                         matches: Vec::new(),
                                         selected_index: 0,
+                                        file_cache: Arc::new(filtered_cache),
                                     };
+
+                                    // Spawn background thread to refresh this directory in the cache
+                                    let current_dir = explorer.current_dir.clone();
+                                    let show_hidden = explorer.show_hidden;
+                                    thread::spawn(move || {
+                                        let mut fresh_cache = Vec::new();
+                                        build_file_cache_static(&current_dir, None, 0, &mut fresh_cache, show_hidden);
+                                        // TODO: Merge these back into global cache
+                                    });
                                 }
                                 _ => {}
                             }
