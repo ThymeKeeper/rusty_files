@@ -321,11 +321,11 @@ impl FileExplorer {
                 .to_string();
 
             let is_current = path == &self.current_dir;
-            // Use corner pipe (└─) for directories on path to current
+            // Use corner pipe (╰─) for directories on path to current
             let marker = if depth == ancestors.len() - 1 {
-                "└─"  // Current directory (last in ancestors list)
+                "╰─"  // Current directory (last in ancestors list)
             } else if depth > 0 {
-                "└─"  // Intermediate directories on path
+                "╰─"  // Intermediate directories on path
             } else {
                 "─ "  // Root directory
             };
@@ -349,7 +349,7 @@ impl FileExplorer {
 
                 for (i, entry) in self.entries.iter().enumerate() {
                     let is_last = i == self.entries.len() - 1;
-                    let tree_char = if is_last { "└─" } else { "├─" };
+                    let tree_char = if is_last { "╰─" } else { "├─" };
                     let icon = Self::get_file_icon(&entry.name, entry.is_dir, entry.permissions);
                     let perms_str = Self::format_permissions(entry.permissions, entry.is_dir);
                     let date_str = Self::format_date(entry.modified);
@@ -363,7 +363,7 @@ impl FileExplorer {
                     let date_width = 29;
                     let buffer = 1; // Space between filename and timestamp (reduced to move timestamp left)
 
-                    // tree_char "├─" or "└─" is 2 chars
+                    // tree_char "├─" or "╰─" is 2 chars
                     // icon "" or "" is 1 char + space = 2 chars
                     let tree_char_width = 2;
                     let icon_display_width = 2; // " " or " "
@@ -3136,17 +3136,31 @@ fn run_app<B: ratatui::backend::Backend>(
                                     // Ctrl+T: Open terminal at current directory
                                     let dir = explorer.current_dir.clone();
                                     // Check $TERMINAL env var first, fall back to kitty
-                                    let terminal = std::env::var("TERMINAL")
+                                    let terminal_cmd = std::env::var("TERMINAL")
                                         .unwrap_or_else(|_| "kitty".to_string());
 
-                                    match std::process::Command::new(&terminal)
-                                        .current_dir(&dir)
+                                    let dir_str = match dir.to_str() {
+                                        Some(s) => s,
+                                        None => {
+                                            explorer.show_status("Invalid directory path".to_string());
+                                            continue;
+                                        }
+                                    };
+
+                                    // Use setsid -f to detach the terminal from the parent process
+                                    // This creates a new session and forks, making the terminal independent
+                                    let command = format!("cd '{}' && setsid -f {} >/dev/null 2>&1", dir_str, terminal_cmd);
+
+                                    match std::process::Command::new("sh")
+                                        .arg("-c")
+                                        .arg(&command)
+                                        .stdin(std::process::Stdio::null())
                                         .stdout(std::process::Stdio::null())
                                         .stderr(std::process::Stdio::null())
                                         .spawn()
                                     {
                                         Ok(_) => {
-                                            explorer.show_status(format!("Opened {} terminal", terminal));
+                                            explorer.show_status(format!("Opened {} terminal", terminal_cmd));
                                         }
                                         Err(e) => {
                                             explorer.show_status(format!("Failed to open terminal: {}", e));
