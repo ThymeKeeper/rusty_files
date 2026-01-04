@@ -182,6 +182,7 @@ struct FileExplorer {
     status_message: Option<String>, // Temporary status message to show in status bar
     status_message_time: Option<std::time::Instant>, // When the status message was set
     fuzzy_cache: Arc<Vec<CachedFile>>, // Persistent cache for fuzzy find (built on startup)
+    help_scroll_offset: usize, // Scroll offset for help screen
 }
 
 impl FileExplorer {
@@ -217,6 +218,7 @@ impl FileExplorer {
             status_message: None, // No status message initially
             status_message_time: None, // No status message timestamp initially
             fuzzy_cache: Arc::new(Vec::new()), // Start with empty cache, will be built in background
+            help_scroll_offset: 0, // Help screen starts at top
         };
         explorer.load_directory()?;
         Ok(explorer)
@@ -1940,7 +1942,16 @@ impl FileExplorer {
             self.ui_mode = UIMode::Normal;
         } else {
             self.ui_mode = UIMode::Help;
+            self.help_scroll_offset = 0; // Reset scroll when opening help
         }
+    }
+
+    fn scroll_help_up(&mut self) {
+        self.help_scroll_offset = self.help_scroll_offset.saturating_sub(1);
+    }
+
+    fn scroll_help_down(&mut self) {
+        self.help_scroll_offset += 1;
     }
 
     fn get_ancestors(&self) -> Vec<PathBuf> {
@@ -2547,51 +2558,172 @@ fn run_app<B: ratatui::backend::Backend>(
                 // Clear the entire screen first
                 f.render_widget(Clear, area);
 
-                let help_text = vec![
-                    "Keyboard Shortcuts",
-                    "",
-                    "Navigation:",
-                    "  Up/Down        - Move cursor",
-                    "  Left           - Go to parent directory",
-                    "  Right          - Enter directory",
-                    "  Enter          - Open file/directory",
-                    "",
-                    "Selection:",
-                    "  Shift+Up/Down  - Select range",
-                    "  Ctrl+Space     - Toggle selection",
-                    "  Mouse drag     - Select multiple",
-                    "",
-                    "File Operations:",
-                    "  Ctrl+C         - Copy",
-                    "  Ctrl+X         - Cut",
-                    "  Ctrl+V         - Paste",
-                    "  Ctrl+N         - Create new",
-                    "  Ctrl+R         - Rename",
-                    "  Delete         - Delete",
-                    "  Ctrl+D         - Copy path to clipboard",
-                    "  Ctrl+Z         - Undo",
-                    "",
-                    "View Options:",
-                    "  Ctrl+S         - Toggle sort (Name/Date)",
-                    "  Ctrl+H         - Toggle hidden files",
-                    "  Ctrl+L         - Refresh display",
-                    "",
-                    "Other:",
-                    "  Ctrl+T         - Open terminal at current directory",
-                    "  F1             - Show/hide this help",
-                    "  Ctrl+Q         - Quit",
-                    "",
-                    "Press F1 or Esc to close this help",
-                ].join("\n");
+                let bg_color = Color::Rgb(40, 40, 40);
+                let title_color = Color::Cyan;
+                let section_color = Color::Yellow;
+                let key_color = Color::Green;
+                let desc_color = Color::White;
 
-                let para = Paragraph::new(help_text)
-                    .block(Block::default()
-                        .title("Help - Keyboard Shortcuts")
-                        .title_alignment(Alignment::Center))
-                    .style(Style::default().fg(Color::Rgb(165, 162, 157)).bg(Color::Rgb(30, 30, 30)))  // Bright neutral grey (normal text) on background
-                    .alignment(Alignment::Left)
-                    .wrap(Wrap { trim: false });
-                f.render_widget(para, area);
+                let mut help_lines = vec![];
+
+                // Title
+                help_lines.push(Line::from(vec![
+                    Span::styled("", Style::default()),
+                ]));
+                help_lines.push(Line::from(vec![
+                    Span::styled("                    RUSTY FILES - Keyboard Shortcuts",
+                        Style::default().fg(title_color))
+                ]));
+                help_lines.push(Line::from(vec![Span::styled("", Style::default())]));
+
+                // Navigation section
+                help_lines.push(Line::from(vec![
+                    Span::styled("  NAVIGATION", Style::default().fg(section_color))
+                ]));
+                help_lines.push(Line::from(vec![
+                    Span::styled("    Up/Down                       ", Style::default().fg(key_color)),
+                    Span::styled("Move cursor", Style::default().fg(desc_color))
+                ]));
+                help_lines.push(Line::from(vec![
+                    Span::styled("    Left                          ", Style::default().fg(key_color)),
+                    Span::styled("Go to parent directory", Style::default().fg(desc_color))
+                ]));
+                help_lines.push(Line::from(vec![
+                    Span::styled("    Right                         ", Style::default().fg(key_color)),
+                    Span::styled("Enter directory", Style::default().fg(desc_color))
+                ]));
+                help_lines.push(Line::from(vec![
+                    Span::styled("    Enter                         ", Style::default().fg(key_color)),
+                    Span::styled("Open file/directory", Style::default().fg(desc_color))
+                ]));
+                help_lines.push(Line::from(vec![Span::styled("", Style::default())]));
+
+                // Selection section
+                help_lines.push(Line::from(vec![
+                    Span::styled("  SELECTION", Style::default().fg(section_color))
+                ]));
+                help_lines.push(Line::from(vec![
+                    Span::styled("    Shift+Up/Down                 ", Style::default().fg(key_color)),
+                    Span::styled("Select range", Style::default().fg(desc_color))
+                ]));
+                help_lines.push(Line::from(vec![
+                    Span::styled("    Ctrl+Space                    ", Style::default().fg(key_color)),
+                    Span::styled("Toggle selection", Style::default().fg(desc_color))
+                ]));
+                help_lines.push(Line::from(vec![
+                    Span::styled("    Mouse Click+Drag              ", Style::default().fg(key_color)),
+                    Span::styled("Select multiple", Style::default().fg(desc_color))
+                ]));
+                help_lines.push(Line::from(vec![Span::styled("", Style::default())]));
+
+                // File Operations section
+                help_lines.push(Line::from(vec![
+                    Span::styled("  FILE OPERATIONS", Style::default().fg(section_color))
+                ]));
+                help_lines.push(Line::from(vec![
+                    Span::styled("    Ctrl+C                        ", Style::default().fg(key_color)),
+                    Span::styled("Copy", Style::default().fg(desc_color))
+                ]));
+                help_lines.push(Line::from(vec![
+                    Span::styled("    Ctrl+X                        ", Style::default().fg(key_color)),
+                    Span::styled("Cut", Style::default().fg(desc_color))
+                ]));
+                help_lines.push(Line::from(vec![
+                    Span::styled("    Ctrl+V                        ", Style::default().fg(key_color)),
+                    Span::styled("Paste", Style::default().fg(desc_color))
+                ]));
+                help_lines.push(Line::from(vec![
+                    Span::styled("    Ctrl+N                        ", Style::default().fg(key_color)),
+                    Span::styled("Create new", Style::default().fg(desc_color))
+                ]));
+                help_lines.push(Line::from(vec![
+                    Span::styled("    Ctrl+R                        ", Style::default().fg(key_color)),
+                    Span::styled("Rename", Style::default().fg(desc_color))
+                ]));
+                help_lines.push(Line::from(vec![
+                    Span::styled("    Delete                        ", Style::default().fg(key_color)),
+                    Span::styled("Delete", Style::default().fg(desc_color))
+                ]));
+                help_lines.push(Line::from(vec![
+                    Span::styled("    Ctrl+D                        ", Style::default().fg(key_color)),
+                    Span::styled("Copy path to clipboard", Style::default().fg(desc_color))
+                ]));
+                help_lines.push(Line::from(vec![
+                    Span::styled("    Ctrl+Z                        ", Style::default().fg(key_color)),
+                    Span::styled("Undo", Style::default().fg(desc_color))
+                ]));
+                help_lines.push(Line::from(vec![Span::styled("", Style::default())]));
+
+                // View Options section
+                help_lines.push(Line::from(vec![
+                    Span::styled("  VIEW OPTIONS", Style::default().fg(section_color))
+                ]));
+                help_lines.push(Line::from(vec![
+                    Span::styled("    Ctrl+S                        ", Style::default().fg(key_color)),
+                    Span::styled("Toggle sort (Name/Date)", Style::default().fg(desc_color))
+                ]));
+                help_lines.push(Line::from(vec![
+                    Span::styled("    Ctrl+H                        ", Style::default().fg(key_color)),
+                    Span::styled("Toggle hidden files", Style::default().fg(desc_color))
+                ]));
+                help_lines.push(Line::from(vec![
+                    Span::styled("    Ctrl+L                        ", Style::default().fg(key_color)),
+                    Span::styled("Refresh display", Style::default().fg(desc_color))
+                ]));
+                help_lines.push(Line::from(vec![Span::styled("", Style::default())]));
+
+                // Other section
+                help_lines.push(Line::from(vec![
+                    Span::styled("  OTHER", Style::default().fg(section_color))
+                ]));
+                help_lines.push(Line::from(vec![
+                    Span::styled("    Ctrl+T                        ", Style::default().fg(key_color)),
+                    Span::styled("Open terminal at current directory", Style::default().fg(desc_color))
+                ]));
+                help_lines.push(Line::from(vec![
+                    Span::styled("    F1                            ", Style::default().fg(key_color)),
+                    Span::styled("Show/hide this help", Style::default().fg(desc_color))
+                ]));
+                help_lines.push(Line::from(vec![
+                    Span::styled("    Ctrl+Q                        ", Style::default().fg(key_color)),
+                    Span::styled("Quit", Style::default().fg(desc_color))
+                ]));
+                help_lines.push(Line::from(vec![Span::styled("", Style::default())]));
+                help_lines.push(Line::from(vec![Span::styled("", Style::default())]));
+
+                // Apply scroll offset: skip lines from the beginning
+                let scrolled_lines: Vec<Line> = help_lines.into_iter()
+                    .skip(explorer.help_scroll_offset)
+                    .collect();
+
+                // Split the area to have a fixed footer at the bottom
+                let chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Min(0),       // Main scrollable content
+                        Constraint::Length(2),    // Fixed footer (2 lines: blank + text)
+                    ])
+                    .split(area);
+
+                // Render scrollable content
+                let para = Paragraph::new(scrolled_lines)
+                    .block(Block::default())
+                    .style(Style::default().bg(bg_color))
+                    .alignment(Alignment::Left);
+                f.render_widget(para, chunks[0]);
+
+                // Render fixed footer
+                let footer_lines = vec![
+                    Line::from(vec![Span::styled("", Style::default())]),
+                    Line::from(vec![
+                        Span::styled("           Use Up/Down arrows to scroll | Press F1 or Esc to close",
+                            Style::default().fg(title_color))
+                    ]),
+                ];
+                let footer_para = Paragraph::new(footer_lines)
+                    .style(Style::default().bg(bg_color))
+                    .alignment(Alignment::Left);
+                f.render_widget(footer_para, chunks[1]);
             }
         })?;
 
@@ -3012,6 +3144,12 @@ fn run_app<B: ratatui::backend::Backend>(
                             match key.code {
                                 KeyCode::F(1) | KeyCode::Esc => {
                                     explorer.toggle_help();
+                                }
+                                KeyCode::Up => {
+                                    explorer.scroll_help_up();
+                                }
+                                KeyCode::Down => {
+                                    explorer.scroll_help_down();
                                 }
                                 _ => {}
                             }
