@@ -66,7 +66,8 @@ rusty_files
 | `Ctrl+V` | Paste files |
 | `Ctrl+N` | Create new file or directory |
 | `Ctrl+R` | Rename file (with full text editing) |
-| `Delete` or `Ctrl+D` | Delete selected files (moves to trash) |
+| `Delete` | Delete selected files (moves to trash) |
+| `Ctrl+D` | Copy full path to system clipboard |
 | `Ctrl+Z` | Undo last operation |
 | `Ctrl+Space` | Toggle selection on current item |
 
@@ -122,12 +123,16 @@ cargo build --release
 
 ### Platform Support
 
-Tested on:
-- Linux (primary development platform)
-- macOS (expected to work, uses `xdg-open` equivalent)
-- Windows (expected to work, uses `cmd /c start`)
+Fully supported on:
+- **Linux** - Primary development platform with full feature support
+- **macOS** - Full support including Terminal.app and iTerm2 integration for Ctrl+T
 
-File opening and sudo operations are platform-aware but have received more extensive testing on Linux.
+Both platforms support:
+- Cross-platform file operations (copy, cut, paste, delete, rename)
+- System clipboard integration (requires xsel, xclip, or wl-clipboard on Linux)
+- Platform-aware file opening (xdg-open on Linux, open on macOS)
+- Sudo operations for privileged file access
+- Terminal launching at current directory
 
 ## Design Philosophy
 

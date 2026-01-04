@@ -2567,7 +2567,8 @@ fn run_app<B: ratatui::backend::Backend>(
                     "  Ctrl+V         - Paste",
                     "  Ctrl+N         - Create new",
                     "  Ctrl+R         - Rename",
-                    "  Ctrl+D/Delete  - Delete",
+                    "  Delete         - Delete",
+                    "  Ctrl+D         - Copy path to clipboard",
                     "  Ctrl+Z         - Undo",
                     "",
                     "View Options:",
@@ -3022,18 +3023,26 @@ fn run_app<B: ratatui::backend::Backend>(
                                     return Ok(());
                                 }
                                 KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                                    // Copy full path of selected match to clipboard
+                                    // Ctrl+D: Copy full path of selected match to clipboard
                                     if let UIMode::FuzzyFind { matches, selected_index, .. } = &explorer.ui_mode {
                                         if let Some(selected) = matches.get(*selected_index) {
                                             let full_path = selected.path.display().to_string();
-                                            if let Ok(mut clipboard) = arboard::Clipboard::new() {
-                                                if clipboard.set_text(&full_path).is_ok() {
-                                                    explorer.show_status(format!("Copied path: {}", full_path));
-                                                } else {
-                                                    explorer.show_status("Failed to copy path to clipboard".to_string());
+                                            match arboard::Clipboard::new() {
+                                                Ok(mut clipboard) => {
+                                                    match clipboard.set_text(&full_path) {
+                                                        Ok(_) => {
+                                                            // Explicitly flush to ensure clipboard persists
+                                                            drop(clipboard);
+                                                            explorer.show_status(format!("Copied to clipboard: {}", full_path));
+                                                        }
+                                                        Err(e) => {
+                                                            explorer.show_status(format!("Failed to set clipboard: {}", e));
+                                                        }
+                                                    }
                                                 }
-                                            } else {
-                                                explorer.show_status("Failed to access clipboard".to_string());
+                                                Err(e) => {
+                                                    explorer.show_status(format!("Clipboard error: {}. Install xsel, xclip, or wl-clipboard", e));
+                                                }
                                             }
                                         }
                                     }
@@ -3135,9 +3144,6 @@ fn run_app<B: ratatui::backend::Backend>(
                                 KeyCode::Char('t') if ctrl => {
                                     // Ctrl+T: Open terminal at current directory
                                     let dir = explorer.current_dir.clone();
-                                    // Check $TERMINAL env var first, fall back to kitty
-                                    let terminal_cmd = std::env::var("TERMINAL")
-                                        .unwrap_or_else(|_| "kitty".to_string());
 
                                     let dir_str = match dir.to_str() {
                                         Some(s) => s,
@@ -3147,20 +3153,69 @@ fn run_app<B: ratatui::backend::Backend>(
                                         }
                                     };
 
-                                    // Use setsid -f to detach the terminal from the parent process
-                                    // This creates a new session and forks, making the terminal independent
-                                    let command = format!("cd '{}' && setsid -f {} >/dev/null 2>&1", dir_str, terminal_cmd);
+                                    let result = if cfg!(target_os = "macos") {
+                                        // macOS: Use osascript to open Terminal.app at the directory
+                                        // Check if user has custom terminal in $TERMINAL
+                                        let terminal_app = std::env::var("TERMINAL")
+                                            .unwrap_or_else(|_| "Terminal".to_string());
 
-                                    match std::process::Command::new("sh")
-                                        .arg("-c")
-                                        .arg(&command)
-                                        .stdin(std::process::Stdio::null())
-                                        .stdout(std::process::Stdio::null())
-                                        .stderr(std::process::Stdio::null())
-                                        .spawn()
-                                    {
+                                        if terminal_app == "Terminal" {
+                                            // Use AppleScript for Terminal.app
+                                            let script = format!(
+                                                "tell application \"Terminal\" to do script \"cd '{}' && clear\"",
+                                                dir_str.replace("'", "'\\''")
+                                            );
+                                            std::process::Command::new("osascript")
+                                                .arg("-e")
+                                                .arg(&script)
+                                                .stdin(std::process::Stdio::null())
+                                                .stdout(std::process::Stdio::null())
+                                                .stderr(std::process::Stdio::null())
+                                                .spawn()
+                                        } else if terminal_app.to_lowercase().contains("iterm") {
+                                            // iTerm2 support
+                                            let script = format!(
+                                                "tell application \"iTerm\" to create window with default profile command \"cd '{}' && clear\"",
+                                                dir_str.replace("'", "'\\''")
+                                            );
+                                            std::process::Command::new("osascript")
+                                                .arg("-e")
+                                                .arg(&script)
+                                                .stdin(std::process::Stdio::null())
+                                                .stdout(std::process::Stdio::null())
+                                                .stderr(std::process::Stdio::null())
+                                                .spawn()
+                                        } else {
+                                            // Generic terminal app - try to open with -n (new instance)
+                                            std::process::Command::new("open")
+                                                .arg("-n")
+                                                .arg("-a")
+                                                .arg(&terminal_app)
+                                                .arg("--args")
+                                                .arg(dir_str)
+                                                .stdin(std::process::Stdio::null())
+                                                .stdout(std::process::Stdio::null())
+                                                .stderr(std::process::Stdio::null())
+                                                .spawn()
+                                        }
+                                    } else {
+                                        // Linux/Unix: Use setsid -f to detach the terminal
+                                        let terminal_cmd = std::env::var("TERMINAL")
+                                            .unwrap_or_else(|_| "kitty".to_string());
+
+                                        let command = format!("cd '{}' && setsid -f {} >/dev/null 2>&1", dir_str, terminal_cmd);
+                                        std::process::Command::new("sh")
+                                            .arg("-c")
+                                            .arg(&command)
+                                            .stdin(std::process::Stdio::null())
+                                            .stdout(std::process::Stdio::null())
+                                            .stderr(std::process::Stdio::null())
+                                            .spawn()
+                                    };
+
+                                    match result {
                                         Ok(_) => {
-                                            explorer.show_status(format!("Opened {} terminal", terminal_cmd));
+                                            explorer.show_status("Opened terminal".to_string());
                                         }
                                         Err(e) => {
                                             explorer.show_status(format!("Failed to open terminal: {}", e));
@@ -3194,17 +3249,25 @@ fn run_app<B: ratatui::backend::Backend>(
                                     explorer.delete_selected();
                                 }
                                 KeyCode::Char('d') if ctrl => {
-                                    // Copy full path to clipboard
+                                    // Ctrl+D: Copy full path to clipboard
                                     if let Some(entry) = explorer.entries.get(explorer.cursor_index) {
                                         let full_path = entry.path.display().to_string();
-                                        if let Ok(mut clipboard) = arboard::Clipboard::new() {
-                                            if clipboard.set_text(&full_path).is_ok() {
-                                                explorer.show_status(format!("Copied path: {}", full_path));
-                                            } else {
-                                                explorer.show_status("Failed to copy path to clipboard".to_string());
+                                        match arboard::Clipboard::new() {
+                                            Ok(mut clipboard) => {
+                                                match clipboard.set_text(&full_path) {
+                                                    Ok(_) => {
+                                                        // Explicitly flush to ensure clipboard persists
+                                                        drop(clipboard);
+                                                        explorer.show_status(format!("Copied to clipboard: {}", full_path));
+                                                    }
+                                                    Err(e) => {
+                                                        explorer.show_status(format!("Failed to set clipboard: {}", e));
+                                                    }
+                                                }
                                             }
-                                        } else {
-                                            explorer.show_status("Failed to access clipboard".to_string());
+                                            Err(e) => {
+                                                explorer.show_status(format!("Clipboard error: {}. Install xsel, xclip, or wl-clipboard", e));
+                                            }
                                         }
                                     }
                                 }
