@@ -2446,7 +2446,7 @@ fn run_app<B: ratatui::backend::Backend>(
             };
 
             let status_bar = Paragraph::new(status_text)
-                .style(Style::default().fg(Color::Rgb(150, 142, 130)).bg(Color::Rgb(30, 30, 30)))  // Medium-bright grey with warm hint (number color) on sage background
+                .style(Style::default().fg(Color::Rgb(185, 177, 160)).bg(Color::Rgb(90, 90, 90)))  // Warm grey text on grey background
                 .alignment(Alignment::Left);
             f.render_widget(status_bar, status_bar_area);
 
