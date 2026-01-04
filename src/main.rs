@@ -997,8 +997,24 @@ fn run_app<B: ratatui::backend::Backend>(
                     }
                 }
                 Event::Mouse(mouse) => {
-                    if matches!(explorer.ui_mode, UIMode::Normal) {
+                    if matches!(explorer.ui_mode, UIMode::Help) {
                         match mouse.kind {
+                            MouseEventKind::ScrollUp => {
+                                explorer.scroll_help_up();
+                            }
+                            MouseEventKind::ScrollDown => {
+                                explorer.scroll_help_down();
+                            }
+                            _ => {}
+                        }
+                    } else if matches!(explorer.ui_mode, UIMode::Normal) {
+                        match mouse.kind {
+                            MouseEventKind::ScrollUp => {
+                                explorer.move_up(false);
+                            }
+                            MouseEventKind::ScrollDown => {
+                                explorer.move_down(false);
+                            }
                             MouseEventKind::Down(MouseButton::Left) => {
                                 explorer.handle_mouse_down(
                                     mouse.row,
