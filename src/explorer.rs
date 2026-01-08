@@ -1035,6 +1035,6 @@ impl FileExplorer {
     /// Build file cache.
     #[allow(dead_code)]
     pub fn build_file_cache(&self, dir: &PathBuf, max_depth: Option<usize>, current_depth: usize, cache: &mut Vec<CachedFile>) {
-        build_file_cache_static(dir, max_depth, current_depth, cache, self.show_hidden);
+        build_file_cache_static(dir, max_depth, current_depth, cache, self.show_hidden, None);
     }
 }
