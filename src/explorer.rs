@@ -16,9 +16,9 @@ use crate::file_operations::{get_default_file_content, perform_file_operation_tr
 use crate::fuzzy_find::{build_file_cache_static, perform_fuzzy_search};
 use crate::types::{
     CachedFile, Clipboard, ClipboardOp, CreationType, DirEntry, DirState, FuzzyMatch,
-    OperationType, PendingOperation, SortMode, TreeLine, UIMode, UndoAction,
+    OperationType, PendingOperation, QuickNavLocation, SortMode, StatusType, TreeLine, UIMode, UndoAction,
 };
-use crate::ui::{format_date, format_permissions, get_file_icon};
+use crate::ui::{format_date, format_file_size, format_permissions, get_file_icon};
 
 /// The main file explorer state.
 pub struct FileExplorer {
@@ -38,7 +38,7 @@ pub struct FileExplorer {
     pub sort_mode: SortMode,
     pub terminal_width: usize,
     pub show_hidden: bool,
-    pub status_message: Option<String>,
+    pub status_message: Option<(String, StatusType)>,
     pub status_message_time: Option<std::time::Instant>,
     pub fuzzy_cache: Arc<Vec<CachedFile>>,
     pub help_scroll_offset: usize,
@@ -86,7 +86,20 @@ impl FileExplorer {
                     entry.file_name().into_string(),
                     entry.metadata()
                 ) {
-                    if !self.show_hidden && name.starts_with('.') {
+                    // Check for hidden files (Unix: dot prefix, Windows: hidden attribute)
+                    let is_hidden_unix = name.starts_with('.');
+                    #[cfg(windows)]
+                    let is_hidden_windows = {
+                        use std::os::windows::fs::MetadataExt;
+                        const FILE_ATTRIBUTE_HIDDEN: u32 = 0x2;
+                        const FILE_ATTRIBUTE_SYSTEM: u32 = 0x4;
+                        let attrs = metadata.file_attributes();
+                        (attrs & FILE_ATTRIBUTE_HIDDEN != 0) || (attrs & FILE_ATTRIBUTE_SYSTEM != 0)
+                    };
+                    #[cfg(not(windows))]
+                    let is_hidden_windows = false;
+
+                    if !self.show_hidden && (is_hidden_unix || is_hidden_windows) {
                         continue;
                     }
 
@@ -99,6 +112,8 @@ impl FileExplorer {
                         metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH)
                     };
 
+                    let size = if is_dir { 0 } else { metadata.len() };
+
                     #[cfg(unix)]
                     let permissions = metadata.permissions().mode();
                     #[cfg(not(unix))]
@@ -108,6 +123,7 @@ impl FileExplorer {
                         path,
                         name,
                         is_dir,
+                        size,
                         modified,
                         permissions,
                     });
@@ -179,6 +195,7 @@ impl FileExplorer {
 
             lines.push(TreeLine {
                 tree_prefix: format!("{}{}", indent, marker),
+                icon: String::new(),
                 text: name,
                 timestamp: None,
                 entry_index: None,
@@ -198,11 +215,16 @@ impl FileExplorer {
                     let icon = get_file_icon(&entry.name, entry.is_dir, entry.permissions);
                     let perms_str = format_permissions(entry.permissions, entry.is_dir);
                     let date_str = format_date(entry.modified);
-                    let timestamp_str = format!("{}   {}", perms_str, date_str);
+                    let size_str = if entry.is_dir {
+                        "         ".to_string()  // 9 spaces to match size column width
+                    } else {
+                        format_file_size(entry.size)
+                    };
+                    let timestamp_str = format!("{}  {}   {}", size_str, perms_str, date_str);
 
                     let is_hidden = entry.name.starts_with('.');
 
-                    let date_width = 29;
+                    let date_width = 41;  // 9 (size) + 2 (spaces) + 10 (perms) + 3 (spaces) + 17 (date)
                     let buffer = 1;
                     let tree_char_width = 2;
                     let icon_display_width = 2;
@@ -223,7 +245,8 @@ impl FileExplorer {
                     let padding = " ".repeat(padding_for_name);
 
                     lines.push(TreeLine {
-                        tree_prefix: format!("{}{} {} ", child_indent, tree_char, icon),
+                        tree_prefix: format!("{}{} ", child_indent, tree_char),
+                        icon: format!("{} ", icon),
                         text: format!("{}{}", display_name, padding),
                         timestamp: Some(timestamp_str),
                         entry_index: Some(i),
@@ -405,7 +428,7 @@ impl FileExplorer {
                 let path = entry.path.clone();
                 let name = entry.name.clone();
                 if let Err(e) = self.open_file(&path) {
-                    self.show_status(format!("Failed to open file: {}", e));
+                    self.show_error(format!("Failed to open file: {}", e));
                 } else {
                     self.show_status(format!("Opening '{}'", name));
                 }
@@ -557,7 +580,7 @@ impl FileExplorer {
                     };
                 }
                 Err(e) => {
-                    self.show_status(format!("Error: {}", e));
+                    self.show_error(format!("Error: {}", e));
                 }
             }
         }
@@ -783,13 +806,13 @@ impl FileExplorer {
                                         self.show_status(format!("Restored {} item(s) from trash", restore_count));
                                     }
                                     Err(e) => {
-                                        self.show_status(format!("Failed to restore: {}", e));
+                                        self.show_error(format!("Failed to restore: {}", e));
                                     }
                                 }
                             }
                         }
                         Err(e) => {
-                            self.show_status(format!("Cannot access trash: {}", e));
+                            self.show_error(format!("Cannot access trash: {}", e));
                         }
                     }
                     Ok(())
@@ -914,9 +937,15 @@ impl FileExplorer {
         }
     }
 
-    /// Show a status message.
+    /// Show a status message with a specific type.
     pub fn show_status(&mut self, message: String) {
-        self.status_message = Some(message);
+        self.status_message = Some((message, StatusType::Info));
+        self.status_message_time = Some(std::time::Instant::now());
+    }
+
+    /// Show an error status message (more prominent styling).
+    pub fn show_error(&mut self, message: String) {
+        self.status_message = Some((message, StatusType::Error));
         self.status_message_time = Some(std::time::Instant::now());
     }
 
@@ -1048,5 +1077,134 @@ impl FileExplorer {
     #[allow(dead_code)]
     pub fn build_file_cache(&self, dir: &PathBuf, max_depth: Option<usize>, current_depth: usize, cache: &mut Vec<CachedFile>) {
         build_file_cache_static(dir, max_depth, current_depth, cache, self.show_hidden, None);
+    }
+
+    /// Get quick navigation locations.
+    pub fn get_quick_nav_locations(&self) -> Vec<QuickNavLocation> {
+        let mut locations = Vec::new();
+
+        // Home directory
+        #[cfg(windows)]
+        let home = std::env::var("USERPROFILE").ok().map(PathBuf::from);
+        #[cfg(not(windows))]
+        let home = std::env::var("HOME").ok().map(PathBuf::from);
+
+        if let Some(home_path) = home {
+            // Home
+            locations.push(QuickNavLocation {
+                name: "Home".to_string(),
+                path: Some(home_path.clone()),
+                icon: "\u{f015}".to_string(),  //
+                is_virtual: false,
+            });
+
+            // Desktop
+            let desktop = home_path.join("Desktop");
+            if desktop.exists() {
+                locations.push(QuickNavLocation {
+                    name: "Desktop".to_string(),
+                    path: Some(desktop),
+                    icon: "\u{f108}".to_string(),  //
+                    is_virtual: false,
+                });
+            }
+
+            // Downloads
+            let downloads = home_path.join("Downloads");
+            if downloads.exists() {
+                locations.push(QuickNavLocation {
+                    name: "Downloads".to_string(),
+                    path: Some(downloads),
+                    icon: "\u{f019}".to_string(),  //
+                    is_virtual: false,
+                });
+            }
+
+            // Documents
+            let documents = home_path.join("Documents");
+            if documents.exists() {
+                locations.push(QuickNavLocation {
+                    name: "Documents".to_string(),
+                    path: Some(documents),
+                    icon: "\u{f07b}".to_string(),  //
+                    is_virtual: false,
+                });
+            }
+
+            // Pictures
+            let pictures = home_path.join("Pictures");
+            if pictures.exists() {
+                locations.push(QuickNavLocation {
+                    name: "Pictures".to_string(),
+                    path: Some(pictures),
+                    icon: "\u{f03e}".to_string(),  //
+                    is_virtual: false,
+                });
+            }
+        }
+
+        // System Trash/Recycle Bin (virtual - we'll list contents differently)
+        locations.push(QuickNavLocation {
+            name: "Trash".to_string(),
+            path: None,
+            icon: "\u{f1f8}".to_string(),  //
+            is_virtual: true,
+        });
+
+        // Project root (find .git directory going up from current)
+        let mut check_dir = self.current_dir.clone();
+        loop {
+            if check_dir.join(".git").exists() {
+                locations.push(QuickNavLocation {
+                    name: "Project Root".to_string(),
+                    path: Some(check_dir),
+                    icon: "\u{f126}".to_string(),  //
+                    is_virtual: false,
+                });
+                break;
+            }
+            if let Some(parent) = check_dir.parent() {
+                check_dir = parent.to_path_buf();
+            } else {
+                break;
+            }
+        }
+
+        // Root directory
+        #[cfg(windows)]
+        {
+            // Add common drive letters on Windows
+            for letter in ['C', 'D', 'E'] {
+                let drive = PathBuf::from(format!("{}:\\", letter));
+                if drive.exists() {
+                    locations.push(QuickNavLocation {
+                        name: format!("Drive {}", letter),
+                        path: Some(drive),
+                        icon: "\u{f0a0}".to_string(),  //
+                        is_virtual: false,
+                    });
+                }
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            locations.push(QuickNavLocation {
+                name: "Root".to_string(),
+                path: Some(PathBuf::from("/")),
+                icon: "\u{f0a0}".to_string(),  //
+                is_virtual: false,
+            });
+        }
+
+        locations
+    }
+
+    /// Open the quick nav popup.
+    pub fn open_quick_nav(&mut self) {
+        let locations = self.get_quick_nav_locations();
+        self.ui_mode = UIMode::QuickNav {
+            locations,
+            selected_index: 0,
+        };
     }
 }

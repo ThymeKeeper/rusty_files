@@ -15,12 +15,21 @@ pub enum SortMode {
     Date,
 }
 
+/// Status message type for different visual styles.
+#[derive(Clone, Debug, PartialEq)]
+pub enum StatusType {
+    Info,    // Normal informational messages
+    Prompt,  // User input required (confirmations, passwords)
+    Error,   // Errors and access denials
+}
+
 /// A directory entry with metadata.
 #[derive(Clone, Debug)]
 pub struct DirEntry {
     pub path: PathBuf,
     pub name: String,
     pub is_dir: bool,
+    pub size: u64,
     pub modified: SystemTime,
     pub permissions: u32,
 }
@@ -106,6 +115,19 @@ pub enum UIMode {
         selected_index: usize,
         file_cache: Arc<Vec<CachedFile>>,
     },
+    QuickNav {
+        locations: Vec<QuickNavLocation>,
+        selected_index: usize,
+    },
+}
+
+/// A quick navigation location.
+#[derive(Clone, Debug)]
+pub struct QuickNavLocation {
+    pub name: String,
+    pub path: Option<PathBuf>,
+    pub icon: String,
+    pub is_virtual: bool,  // true for trash (not a real directory)
 }
 
 /// A cached file entry for fuzzy finding.
@@ -152,6 +174,7 @@ pub struct PendingOperation {
 #[allow(dead_code)]
 pub struct TreeLine {
     pub tree_prefix: String,
+    pub icon: String,
     pub text: String,
     pub timestamp: Option<String>,
     pub entry_index: Option<usize>,

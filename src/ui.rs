@@ -3,8 +3,10 @@
 //! This module contains functions for rendering the user interface,
 //! including the tree view, status bar, help screen, and various dialogs.
 
+use std::path::Path;
 use std::time::SystemTime;
 
+use fs2::statvfs;
 use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
@@ -14,13 +16,13 @@ use ratatui::{
 };
 
 use crate::explorer::FileExplorer;
-use crate::types::{CachedFile, CreationType, FuzzyMatch, TreeLine, UIMode};
+use crate::types::{CachedFile, CreationType, FuzzyMatch, QuickNavLocation, StatusType, TreeLine, UIMode};
 
 /// Get icon for a file based on name, type, and permissions.
 pub fn get_file_icon(name: &str, is_dir: bool, permissions: u32) -> &'static str {
     // Directories
     if is_dir {
-        return "";
+        return "\u{f07b}";  //
     }
 
     // Check if executable (any execute bit set)
@@ -35,58 +37,58 @@ pub fn get_file_icon(name: &str, is_dir: bool, permissions: u32) -> &'static str
 
     // Check for specific filenames first
     match name {
-        ".git" | ".gitignore" | ".gitmodules" | ".gitattributes" => return "",
-        "Cargo.toml" | "Cargo.lock" => return "",
-        "package.json" | "package-lock.json" => return "",
-        "README.md" | "readme.md" => return "",
-        "Makefile" | "makefile" => return "",
-        "Dockerfile" | "docker-compose.yml" => return "",
+        ".git" | ".gitignore" | ".gitmodules" | ".gitattributes" => return "\u{f1d3}",  //
+        "Cargo.toml" | "Cargo.lock" => return "\u{e7a8}",  //
+        "package.json" | "package-lock.json" => return "\u{e718}",  //
+        "README.md" | "readme.md" => return "\u{f48a}",  //
+        "Makefile" | "makefile" => return "\u{f489}",  //
+        "Dockerfile" | "docker-compose.yml" => return "\u{f308}",  //
         _ => {}
     }
 
     // Check by extension
     match extension.to_lowercase().as_str() {
         // Programming languages
-        "rs" => "",
-        "py" => "",
-        "js" | "jsx" | "mjs" => "",
-        "ts" | "tsx" => "",
-        "go" => "",
-        "c" | "h" => "",
-        "cpp" | "cc" | "cxx" | "hpp" => "",
-        "java" => "",
-        "rb" => "",
-        "php" => "",
-        "sh" | "bash" | "zsh" | "fish" => "",
+        "rs" => "\u{e7a8}",  //
+        "py" => "\u{e73c}",  //
+        "js" | "jsx" | "mjs" => "\u{e74e}",  //
+        "ts" | "tsx" => "\u{e628}",  //
+        "go" => "\u{e626}",  //
+        "c" | "h" => "\u{e61e}",  //
+        "cpp" | "cc" | "cxx" | "hpp" => "\u{e61d}",  //
+        "java" => "\u{e738}",  //
+        "rb" => "\u{e21e}",  //
+        "php" => "\u{e73d}",  //
+        "sh" | "bash" | "zsh" | "fish" => "\u{e795}",  //
 
         // Markup/Data
-        "html" | "htm" => "",
-        "css" | "scss" | "sass" | "less" => "",
-        "json" => "",
-        "xml" => "",
-        "yaml" | "yml" => "",
-        "toml" => "",
-        "md" | "markdown" => "",
+        "html" | "htm" => "\u{e736}",  //
+        "css" | "scss" | "sass" | "less" => "\u{e749}",  //
+        "json" => "\u{e60b}",  //
+        "xml" => "\u{e619}",  //
+        "yaml" | "yml" => "\u{e6a8}",  //
+        "toml" => "\u{e6b2}",  //
+        "md" | "markdown" => "\u{e73e}",  //
 
         // Archives
-        "zip" | "tar" | "gz" | "bz2" | "xz" | "7z" | "rar" => "",
+        "zip" | "tar" | "gz" | "bz2" | "xz" | "7z" | "rar" => "\u{f410}",  //
 
         // Images
-        "png" | "jpg" | "jpeg" | "gif" | "bmp" | "svg" | "ico" => "",
+        "png" | "jpg" | "jpeg" | "gif" | "bmp" | "svg" | "ico" => "\u{f03e}",  //
 
         // Documents
-        "pdf" => "",
-        "txt" => "",
+        "pdf" => "\u{f1c1}",  //
+        "txt" => "\u{f15c}",  //
 
         // Executables/binaries
-        "exe" | "bin" | "out" => "",
+        "exe" | "bin" | "out" => "\u{f489}",  //
 
         // Default for unknown extensions
         _ => {
             if is_executable {
-                ""  // Executable file
+                "\u{f489}"  //  Executable file
             } else {
-                ""  // Regular file
+                "\u{f15b}"  //  Regular file
             }
         }
     }
@@ -114,20 +116,109 @@ pub fn format_permissions(mode: u32, is_dir: bool) -> String {
         other_r, other_w, other_x)
 }
 
-/// Format a file size in human-readable format.
+/// Format a file size in human-readable format (right-aligned, fixed width).
 pub fn format_file_size(size: u64) -> String {
     const KB: u64 = 1024;
     const MB: u64 = KB * 1024;
     const GB: u64 = MB * 1024;
+    const TB: u64 = GB * 1024;
+    const PB: u64 = TB * 1024;
 
-    if size >= GB {
-        format!("{:.2} GB", size as f64 / GB as f64)
+    if size >= PB {
+        format!("{:>6.1} PB", size as f64 / PB as f64)
+    } else if size >= TB {
+        format!("{:>6.1} TB", size as f64 / TB as f64)
+    } else if size >= GB {
+        format!("{:>6.1} GB", size as f64 / GB as f64)
     } else if size >= MB {
-        format!("{:.2} MB", size as f64 / MB as f64)
+        format!("{:>6.1} MB", size as f64 / MB as f64)
     } else if size >= KB {
-        format!("{:.2} KB", size as f64 / KB as f64)
+        format!("{:>6.1} KB", size as f64 / KB as f64)
+    } else {
+        format!("{:>6}  B", size)
+    }
+}
+
+/// Format a file size compactly (no padding).
+pub fn format_size_compact(size: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = KB * 1024;
+    const GB: u64 = MB * 1024;
+    const TB: u64 = GB * 1024;
+    const PB: u64 = TB * 1024;
+
+    if size >= PB {
+        format!("{:.1} PB", size as f64 / PB as f64)
+    } else if size >= TB {
+        format!("{:.1} TB", size as f64 / TB as f64)
+    } else if size >= GB {
+        format!("{:.1} GB", size as f64 / GB as f64)
+    } else if size >= MB {
+        format!("{:.1} MB", size as f64 / MB as f64)
+    } else if size >= KB {
+        format!("{:.1} KB", size as f64 / KB as f64)
     } else {
         format!("{} B", size)
+    }
+}
+
+/// Get disk space info for the given path.
+/// Returns (total_size, available_size) or None if unavailable.
+pub fn get_disk_space(path: &Path) -> Option<(u64, u64)> {
+    statvfs(path).ok().map(|stat| {
+        let total = stat.total_space();
+        let available = stat.available_space();
+        (total, available)
+    })
+}
+
+/// Get the drive/mount point for a path.
+fn get_drive_label(path: &Path) -> String {
+    #[cfg(windows)]
+    {
+        // On Windows, get the drive letter (e.g., "C:")
+        if let Some(prefix) = path.components().next() {
+            let prefix_str = prefix.as_os_str().to_string_lossy();
+            if prefix_str.len() >= 2 && prefix_str.chars().nth(1) == Some(':') {
+                return prefix_str.chars().take(2).collect();
+            }
+        }
+        String::new()
+    }
+    #[cfg(not(windows))]
+    {
+        // On Unix, use "/" or the mount point
+        "/".to_string()
+    }
+}
+
+/// Format disk space info as a string for display in header.
+pub fn format_disk_info(path: &Path) -> String {
+    if let Some((total, available)) = get_disk_space(path) {
+        let drive = get_drive_label(path);
+        let percent_used = if total > 0 {
+            ((total.saturating_sub(available)) as f64 / total as f64 * 100.0) as u8
+        } else {
+            0
+        };
+        if drive.is_empty() {
+            format!(
+                "{} free of {} ({}% used)",
+                format_size_compact(available),
+                format_size_compact(total),
+                percent_used
+            )
+        } else {
+            format!(
+                "{}: {} free of {} ({}% used)",
+                drive,
+                format_size_compact(available),
+                format_size_compact(total),
+                percent_used
+            )
+        }
+    } else {
+        String::new()
     }
 }
 
@@ -362,6 +453,7 @@ pub fn build_tree_items(tree_lines: &[TreeLine]) -> Vec<ListItem<'static>> {
 
             let mut spans = vec![
                 Span::styled(tree_line.tree_prefix.clone(), tree_prefix_style),
+                Span::styled(tree_line.icon.clone(), text_style),
                 Span::styled(tree_line.text.clone(), text_style)
             ];
             if let Some(timestamp) = &tree_line.timestamp {
@@ -653,24 +745,25 @@ pub fn render_status_bar(
     area: ratatui::layout::Rect,
     explorer: &FileExplorer,
 ) {
-    let status_text = if let Some(ref msg) = explorer.status_message {
-        msg.clone()
+    // Determine status text and type
+    let (status_text, status_type) = if let Some((ref msg, ref stype)) = explorer.status_message {
+        (msg.clone(), stype.clone())
     } else {
         match &explorer.ui_mode {
             UIMode::PasswordPrompt { prompt, password, .. } => {
                 let masked_password = "*".repeat(password.len());
-                format!("{} {}", prompt, masked_password)
+                (format!("{} {}", prompt, masked_password), StatusType::Prompt)
             }
             UIMode::ConfirmDelete { items } => {
-                format!("Delete {} item(s)? (y/n)", items.len())
+                (format!(" \u{f071} Delete {} item(s)? (y/n)", items.len()), StatusType::Prompt)
             }
             UIMode::FuzzyFind { search_term, matches, file_cache, .. } => {
-                format!("Find: {} ({} matches | {} files cached)", search_term, matches.len(), file_cache.len())
+                (format!("Find: {} ({} matches | {} files cached)", search_term, matches.len(), file_cache.len()), StatusType::Info)
             }
             _ => {
                 let total_items = explorer.entries.len();
                 let selected_count = explorer.selected_indices.len();
-                if selected_count > 0 {
+                let text = if selected_count > 0 {
                     let total_size = explorer.get_selected_total_size();
                     let size_str = format_file_size(total_size);
                     format!("{} items | {} selected | {}", total_items, selected_count, size_str)
@@ -684,13 +777,108 @@ pub fn render_status_bar(
                     }
                 } else {
                     format!("{} items", total_items)
-                }
+                };
+                (text, StatusType::Info)
             }
         }
     };
 
+    // Choose style based on status type
+    let style = match status_type {
+        StatusType::Info => {
+            Style::default()
+                .fg(Color::Rgb(185, 177, 160))
+                .bg(Color::Rgb(50, 50, 50))
+        }
+        StatusType::Prompt => {
+            Style::default()
+                .fg(Color::Rgb(30, 30, 30))
+                .bg(Color::Rgb(220, 180, 80))
+                .add_modifier(Modifier::BOLD)
+        }
+        StatusType::Error => {
+            Style::default()
+                .fg(Color::Rgb(255, 255, 255))
+                .bg(Color::Rgb(180, 60, 60))
+                .add_modifier(Modifier::BOLD)
+        }
+    };
+
     let status_bar = Paragraph::new(status_text)
-        .style(Style::default().fg(Color::Rgb(185, 177, 160)).bg(Color::Rgb(90, 90, 90)))
+        .style(style)
         .alignment(Alignment::Left);
     f.render_widget(status_bar, area);
+}
+
+/// Render the quick navigation popup.
+pub fn render_quick_nav_popup(
+    f: &mut Frame,
+    locations: &[QuickNavLocation],
+    selected_index: usize,
+) {
+    let area = f.area();
+
+    // Calculate popup size - make it centered and appropriately sized
+    let popup_width = 50.min(area.width.saturating_sub(4));
+    let popup_height = (locations.len() as u16 + 4).min(area.height.saturating_sub(4));
+
+    let popup_x = (area.width.saturating_sub(popup_width)) / 2;
+    let popup_y = (area.height.saturating_sub(popup_height)) / 2;
+
+    let popup_area = ratatui::layout::Rect::new(popup_x, popup_y, popup_width, popup_height);
+
+    // Clear the area behind the popup
+    f.render_widget(Clear, popup_area);
+
+    // Build the list items
+    let items: Vec<ListItem> = locations
+        .iter()
+        .enumerate()
+        .map(|(i, loc)| {
+            let path_str = if loc.is_virtual {
+                "(virtual)".to_string()
+            } else if let Some(ref path) = loc.path {
+                path.display().to_string()
+            } else {
+                String::new()
+            };
+
+            // Truncate path if too long
+            let max_path_len = popup_width.saturating_sub(10) as usize;
+            let display_path = if path_str.len() > max_path_len {
+                format!("...{}", &path_str[path_str.len().saturating_sub(max_path_len - 3)..])
+            } else {
+                path_str
+            };
+
+            let style = if i == selected_index {
+                Style::default()
+                    .fg(Color::Rgb(30, 30, 30))
+                    .bg(Color::Rgb(140, 180, 120))
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::Rgb(185, 177, 160))
+            };
+
+            let line = Line::from(vec![
+                Span::styled(format!(" {} ", loc.icon), style),
+                Span::styled(format!("{:<12}", loc.name), style.add_modifier(Modifier::BOLD)),
+                Span::styled(display_path, style),
+            ]);
+
+            ListItem::new(line)
+        })
+        .collect();
+
+    let list = ratatui::widgets::List::new(items)
+        .block(
+            Block::bordered()
+                .title(" Quick Nav (G) ")
+                .title_style(Style::default().fg(Color::Rgb(140, 180, 120)).add_modifier(Modifier::BOLD))
+                .border_style(Style::default().fg(Color::Rgb(100, 100, 100)))
+                .style(Style::default().bg(Color::Rgb(45, 45, 45)))
+        )
+        .highlight_style(Style::default());
+
+    f.render_widget(list, popup_area);
 }

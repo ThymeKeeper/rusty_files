@@ -35,9 +35,9 @@ use crate::file_operations::{
 use crate::fuzzy_find::build_file_cache_static;
 use crate::types::{CachedFile, CreationType, OperationType, UIMode, UndoAction};
 use crate::ui::{
-    build_tree_items, get_file_icon, format_permissions,
+    build_tree_items, format_disk_info, get_file_icon, format_permissions,
     render_create_dialog, render_delete_dialog, render_help_screen,
-    render_password_dialog, render_rename_dialog, render_status_bar,
+    render_password_dialog, render_quick_nav_popup, render_rename_dialog, render_status_bar,
 };
 
 /// Run the main application loop.
@@ -341,8 +341,8 @@ fn run_app<B: ratatui::backend::Backend>(
                     .with_selected(Some(cursor_line_idx))
                     .with_offset(explorer.scroll_offset);
 
-                let current_dir_str = explorer.current_dir.display().to_string();
-                let title = format!("File Explorer: {}", current_dir_str);
+                let disk_info = format_disk_info(&explorer.current_dir);
+                let title = format!(" {}", disk_info);
                 (tree_items, list_state, title)
             };
 
@@ -388,6 +388,11 @@ fn run_app<B: ratatui::backend::Backend>(
 
             if matches!(explorer.ui_mode, UIMode::Help) {
                 render_help_screen(f, area, explorer.help_scroll_offset);
+            }
+
+            // Render quick nav popup
+            if let UIMode::QuickNav { ref locations, selected_index } = explorer.ui_mode {
+                render_quick_nav_popup(f, locations, selected_index);
             }
         })?;
 
@@ -453,7 +458,7 @@ fn run_app<B: ratatui::backend::Backend>(
                                                             explorer.select_items_by_name(&[new_name]);
                                                         }
                                                         Err(e) => {
-                                                            explorer.show_status(format!("Error: {}", e));
+                                                            explorer.show_error(format!("Error: {}", e));
                                                         }
                                                     }
                                                 } else {
@@ -473,7 +478,7 @@ fn run_app<B: ratatui::backend::Backend>(
                                                             explorer.select_items_by_name(&pasted_names);
                                                         }
                                                         Err(e) => {
-                                                            explorer.show_status(format!("Error: {}", e));
+                                                            explorer.show_error(format!("Error: {}", e));
                                                         }
                                                     }
                                                 }
@@ -490,7 +495,7 @@ fn run_app<B: ratatui::backend::Backend>(
                                                     explorer.load_directory()?;
                                                 }
                                                 Err(e) => {
-                                                    explorer.show_status(format!("Error: {}", e));
+                                                    explorer.show_error(format!("Error: {}", e));
                                                 }
                                             }
                                         }
@@ -514,7 +519,7 @@ fn run_app<B: ratatui::backend::Backend>(
                                                         explorer.load_directory()?;
                                                     }
                                                     Err(e) => {
-                                                        explorer.show_status(format!("Error: {}", e));
+                                                        explorer.show_error(format!("Error: {}", e));
                                                     }
                                                 }
                                             }
@@ -548,7 +553,7 @@ fn run_app<B: ratatui::backend::Backend>(
                                             };
                                         }
                                         Err(e) => {
-                                            explorer.show_status(format!("Error: {}", e));
+                                            explorer.show_error(format!("Error: {}", e));
                                         }
                                     }
                                 }
@@ -723,7 +728,7 @@ fn run_app<B: ratatui::backend::Backend>(
                                     explorer.ui_mode = UIMode::Normal;
 
                                     if let Err(e) = explorer.rename_item(path, name) {
-                                        explorer.show_status(format!("Error: {}", e));
+                                        explorer.show_error(format!("Error: {}", e));
                                     }
                                 }
                                 KeyCode::Esc => {
@@ -765,7 +770,7 @@ fn run_app<B: ratatui::backend::Backend>(
                                     explorer.ui_mode = UIMode::Normal;
 
                                     if let Err(e) = explorer.create_new_item(ctype, item_name) {
-                                        explorer.show_status(format!("Error: {}", e));
+                                        explorer.show_error(format!("Error: {}", e));
                                     }
                                 }
                                 KeyCode::Esc => {
@@ -805,7 +810,7 @@ fn run_app<B: ratatui::backend::Backend>(
                                                             explorer.show_status(format!("Copied to clipboard: {}", full_path));
                                                         }
                                                         Err(e) => {
-                                                            explorer.show_status(format!("Failed to set clipboard: {}", e));
+                                                            explorer.show_error(format!("Failed to set clipboard: {}", e));
                                                         }
                                                     }
                                                 }
@@ -880,6 +885,53 @@ fn run_app<B: ratatui::backend::Backend>(
                                     explorer.ui_mode = UIMode::Normal;
                                     pending_search = false;
                                     last_search_update = None;
+                                }
+                                _ => {}
+                            }
+                        }
+                        UIMode::QuickNav { locations, selected_index } => {
+                            let selected_index = *selected_index;
+                            match key.code {
+                                KeyCode::Up => {
+                                    if selected_index > 0 {
+                                        explorer.ui_mode = UIMode::QuickNav {
+                                            locations: locations.clone(),
+                                            selected_index: selected_index - 1,
+                                        };
+                                    }
+                                }
+                                KeyCode::Down => {
+                                    if selected_index < locations.len().saturating_sub(1) {
+                                        explorer.ui_mode = UIMode::QuickNav {
+                                            locations: locations.clone(),
+                                            selected_index: selected_index + 1,
+                                        };
+                                    }
+                                }
+                                KeyCode::Enter => {
+                                    if let Some(location) = locations.get(selected_index) {
+                                        if location.is_virtual {
+                                            // Trash is virtual - show status message
+                                            explorer.ui_mode = UIMode::Normal;
+                                            explorer.show_status("Trash view not yet implemented".to_string());
+                                        } else if let Some(ref path) = location.path {
+                                            if path.exists() {
+                                                let nav_path = path.clone();
+                                                explorer.ui_mode = UIMode::Normal;
+                                                explorer.current_dir = nav_path;
+                                                explorer.load_directory()?;
+                                            } else {
+                                                explorer.ui_mode = UIMode::Normal;
+                                                explorer.show_status(format!("Path does not exist: {}", path.display()));
+                                            }
+                                        } else {
+                                            explorer.ui_mode = UIMode::Normal;
+                                            explorer.show_status("No path available".to_string());
+                                        }
+                                    }
+                                }
+                                KeyCode::Esc => {
+                                    explorer.ui_mode = UIMode::Normal;
                                 }
                                 _ => {}
                             }
@@ -966,7 +1018,7 @@ fn run_app<B: ratatui::backend::Backend>(
                                             explorer.show_status("Opened terminal".to_string());
                                         }
                                         Err(e) => {
-                                            explorer.show_status(format!("Failed to open terminal: {}", e));
+                                            explorer.show_error(format!("Failed to open terminal: {}", e));
                                         }
                                     }
                                 }
@@ -1007,7 +1059,7 @@ fn run_app<B: ratatui::backend::Backend>(
                                                         explorer.show_status(format!("Copied to clipboard: {}", full_path));
                                                     }
                                                     Err(e) => {
-                                                        explorer.show_status(format!("Failed to set clipboard: {}", e));
+                                                        explorer.show_error(format!("Failed to set clipboard: {}", e));
                                                     }
                                                 }
                                             }
@@ -1051,6 +1103,9 @@ fn run_app<B: ratatui::backend::Backend>(
                                     });
                                     cache_receiver = Some(receiver);
                                     cache_complete = false;
+                                }
+                                KeyCode::Char('g') if ctrl => {
+                                    explorer.open_quick_nav();
                                 }
                                 _ => {}
                             }
