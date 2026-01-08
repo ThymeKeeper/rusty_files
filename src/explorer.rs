@@ -213,6 +213,30 @@ impl FileExplorer {
                     let is_last = i == self.entries.len() - 1;
                     let tree_char = if is_last { "\u{2570}\u{2500}" } else { "\u{251c}\u{2500}" };
                     let icon = get_file_icon(&entry.name, entry.is_dir, entry.permissions);
+                    let is_hidden = entry.name.starts_with('.');
+
+                    let tree_char_width = 2;
+                    let icon_display_width = 2;
+                    let prefix_len = child_indent.len() + tree_char_width + icon_display_width;
+
+                    // Metadata column width (size + perms + date)
+                    let metadata_width = 42;  // 9 (size) + 2 (spaces) + 10 (perms) + 3 (spaces) + 17 (date) + 1 (buffer)
+
+                    // Minimum width for filename - prioritize showing names over metadata
+                    // Metadata will spill off-screen and get clipped naturally by the terminal
+                    let min_name_width = 20;
+                    let ideal_name_width = terminal_width.saturating_sub(prefix_len + metadata_width);
+                    let name_column_width = ideal_name_width.max(min_name_width);
+
+                    let display_name = if entry.name.chars().count() > name_column_width {
+                        let truncate_at = name_column_width.saturating_sub(3);
+                        let truncated: String = entry.name.chars().take(truncate_at).collect();
+                        format!("{}...", truncated)
+                    } else {
+                        entry.name.clone()
+                    };
+
+                    // Always build metadata - let terminal clip what doesn't fit
                     let perms_str = format_permissions(entry.permissions, entry.is_dir);
                     let date_str = format_date(entry.modified);
                     let size_str = if entry.is_dir {
@@ -222,27 +246,8 @@ impl FileExplorer {
                     };
                     let timestamp_str = format!("{}  {}   {}", size_str, perms_str, date_str);
 
-                    let is_hidden = entry.name.starts_with('.');
-
-                    let date_width = 41;  // 9 (size) + 2 (spaces) + 10 (perms) + 3 (spaces) + 17 (date)
-                    let buffer = 1;
-                    let tree_char_width = 2;
-                    let icon_display_width = 2;
-                    let prefix_len = child_indent.len() + tree_char_width + icon_display_width;
-
-                    let available_width = terminal_width.saturating_sub(prefix_len + date_width + buffer);
-
-                    let display_name = if entry.name.chars().count() > available_width {
-                        let truncate_at = available_width.saturating_sub(3);
-                        let truncated: String = entry.name.chars().take(truncate_at).collect();
-                        format!("{}...", truncated)
-                    } else {
-                        entry.name.clone()
-                    };
-
                     let name_len = display_name.chars().count();
-                    let padding_for_name = available_width.saturating_sub(name_len);
-                    let padding = " ".repeat(padding_for_name);
+                    let padding = " ".repeat(name_column_width.saturating_sub(name_len));
 
                     lines.push(TreeLine {
                         tree_prefix: format!("{}{} ", child_indent, tree_char),
