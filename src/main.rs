@@ -959,7 +959,45 @@ fn run_app<B: ratatui::backend::Backend>(
                                         }
                                     };
 
-                                    let result = if cfg!(target_os = "macos") {
+                                    let result = if cfg!(target_os = "windows") {
+                                        // Escape single quotes for PowerShell by doubling them
+                                        let ps_escaped = dir_str.replace("'", "''");
+
+                                        // Try Windows Terminal with PowerShell cd command
+                                        let wt_result = std::process::Command::new("wt")
+                                            .arg("new-tab")
+                                            .arg("--")
+                                            .arg("powershell")
+                                            .arg("-NoExit")
+                                            .arg("-Command")
+                                            .arg(format!("Set-Location -LiteralPath '{}'", ps_escaped))
+                                            .stdin(std::process::Stdio::null())
+                                            .stdout(std::process::Stdio::null())
+                                            .stderr(std::process::Stdio::null())
+                                            .spawn();
+
+                                        if wt_result.is_err() {
+                                            // Fall back to cmd.exe - start new window in directory
+                                            // Escape special cmd characters
+                                            let cmd_escaped = dir_str.replace("&", "^&")
+                                                .replace("|", "^|")
+                                                .replace("<", "^<")
+                                                .replace(">", "^>");
+                                            std::process::Command::new("cmd")
+                                                .arg("/c")
+                                                .arg("start")
+                                                .arg("")
+                                                .arg("cmd")
+                                                .arg("/k")
+                                                .arg(format!("cd /d \"{}\"", cmd_escaped))
+                                                .stdin(std::process::Stdio::null())
+                                                .stdout(std::process::Stdio::null())
+                                                .stderr(std::process::Stdio::null())
+                                                .spawn()
+                                        } else {
+                                            wt_result
+                                        }
+                                    } else if cfg!(target_os = "macos") {
                                         let terminal_app = std::env::var("TERMINAL")
                                             .unwrap_or_else(|_| "Terminal".to_string());
 
@@ -1000,6 +1038,7 @@ fn run_app<B: ratatui::backend::Backend>(
                                                 .spawn()
                                         }
                                     } else {
+                                        // Linux/Unix
                                         let terminal_cmd = std::env::var("TERMINAL")
                                             .unwrap_or_else(|_| "kitty".to_string());
 
