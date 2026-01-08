@@ -5,6 +5,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{self, Write};
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::Command;
@@ -108,7 +109,10 @@ impl FileExplorer {
                         metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH)
                     };
 
+                    #[cfg(unix)]
                     let permissions = metadata.permissions().mode();
+                    #[cfg(not(unix))]
+                    let permissions = if metadata.permissions().readonly() { 0o444 } else { 0o644 };
 
                     entries.push(DirEntry {
                         path,

@@ -117,17 +117,53 @@ pub fn build_file_cache_static(
 
     // Build override patterns for common bloat directories
     let mut override_builder = OverrideBuilder::new(dir);
+
+    // Development artifacts
     override_builder.add("!node_modules/").ok();
     override_builder.add("!dist/").ok();
     override_builder.add("!build/").ok();
     override_builder.add("!out/").ok();
+    override_builder.add("!target/").ok();  // Rust build directory
+    override_builder.add("!.gradle/").ok();
+    override_builder.add("!.maven/").ok();
+    override_builder.add("!vendor/").ok();  // Go/PHP dependencies
+
+    // Python
     override_builder.add("!__pycache__/").ok();
     override_builder.add("!.pytest_cache/").ok();
     override_builder.add("!.venv/").ok();
     override_builder.add("!venv/").ok();
     override_builder.add("!env/").ok();
+    override_builder.add("!.eggs/").ok();
+    override_builder.add("!*.egg-info/").ok();
+
+    // JavaScript/Web
     override_builder.add("!.next/").ok();
     override_builder.add("!.nuxt/").ok();
+    override_builder.add("!.cache/").ok();
+    override_builder.add("!.parcel-cache/").ok();
+
+    // Git internals
+    override_builder.add("!.git/objects/").ok();
+    override_builder.add("!.git/lfs/").ok();
+
+    // Windows system directories
+    override_builder.add("!$RECYCLE.BIN/").ok();
+    override_builder.add("!System Volume Information/").ok();
+    override_builder.add("!AppData/").ok();
+    override_builder.add("!Windows/").ok();
+    override_builder.add("!ProgramData/").ok();
+    override_builder.add("!Program Files/").ok();
+    override_builder.add("!Program Files (x86)/").ok();
+    override_builder.add("!Recovery/").ok();
+    override_builder.add("!MSOCache/").ok();
+    override_builder.add("!PerfLogs/").ok();
+
+    // macOS/Linux system directories
+    override_builder.add("!Library/").ok();
+    override_builder.add("!/proc/").ok();
+    override_builder.add("!/sys/").ok();
+    override_builder.add("!/dev/").ok();
 
     let overrides = override_builder.build().ok();
 
@@ -147,8 +183,16 @@ pub fn build_file_cache_static(
         walker.overrides(overrides);
     }
 
-    // Collect all results (fast parallel scan, no intermediate cloning)
+    // Limit total files to prevent OOM on large directories
+    const MAX_FILES: usize = 50_000;
+
+    // Collect all results (fast parallel scan)
     for result in walker.build() {
+        // Stop if we've hit the limit
+        if cache.len() >= MAX_FILES {
+            break;
+        }
+
         if let Ok(entry) = result {
             let path = entry.path();
 
@@ -190,9 +234,9 @@ pub fn build_file_cache_static(
         }
     }
 
-    // Send final cache once (avoids OOM from repeated cloning)
+    // Send final cache once (use mem::take to avoid clone)
     if let Some(ref sender) = progress_sender {
-        let _ = sender.send(Arc::new(cache.clone()));
+        let _ = sender.send(Arc::new(std::mem::take(cache)));
     }
 }
 
