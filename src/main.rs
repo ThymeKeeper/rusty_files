@@ -23,7 +23,6 @@ use ratatui::{
     Terminal,
 };
 use std::io;
-use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver};
 use std::sync::Arc;
 use std::thread;
@@ -51,45 +50,70 @@ fn run_app<B: ratatui::backend::Backend>(
     let mut pending_search: bool = false;
     let debounce_ms = 150;
 
-    // Build initial fuzzy cache on startup in background from root
+    // Build initial fuzzy cache on startup in background from current directory
     let mut cache_receiver: Option<Receiver<Arc<Vec<CachedFile>>>> = {
         let (sender, receiver) = mpsc::channel();
-        let cache_dir = PathBuf::from("/");
+        let cache_dir = explorer.current_dir.clone();
         let show_hidden = explorer.show_hidden;
 
         thread::spawn(move || {
             let mut file_cache = Vec::new();
-            build_file_cache_static(&cache_dir, None, 0, &mut file_cache, show_hidden);
-            let _ = sender.send(Arc::new(file_cache));
+            build_file_cache_static(&cache_dir, Some(8), 0, &mut file_cache, show_hidden, Some(sender));
         });
 
         Some(receiver)
     };
+    let mut cache_complete = false;
 
     loop {
         // Check if cache is ready from background thread
         if let Some(ref receiver) = cache_receiver {
-            if let Ok(file_cache) = receiver.try_recv() {
-                explorer.fuzzy_cache = file_cache.clone();
+            match receiver.try_recv() {
+                Ok(file_cache) => {
+                    // Received incremental update
+                    explorer.fuzzy_cache = file_cache.clone();
 
-                let (search_term_clone, should_search) = if let UIMode::FuzzyFind { search_term, file_cache: cache, .. } = &mut explorer.ui_mode {
-                    *cache = file_cache.clone();
-                    (Some(search_term.clone()), true)
-                } else {
-                    (None, false)
-                };
+                    let (search_term_clone, should_search) = if let UIMode::FuzzyFind { search_term, file_cache: cache, .. } = &mut explorer.ui_mode {
+                        *cache = file_cache.clone();
+                        (Some(search_term.clone()), true)
+                    } else {
+                        (None, false)
+                    };
 
-                if should_search {
-                    if let Some(term) = search_term_clone {
-                        let new_matches = explorer.perform_fuzzy_search(&term, &file_cache);
-                        if let UIMode::FuzzyFind { matches, selected_index, .. } = &mut explorer.ui_mode {
-                            *matches = new_matches;
-                            *selected_index = 0;
+                    if should_search {
+                        if let Some(term) = search_term_clone {
+                            if !term.is_empty() {
+                                // Use the just-updated fuzzy_cache (file_cache variable points to it)
+                                let new_matches = explorer.perform_fuzzy_search(&term, &explorer.fuzzy_cache);
+                                if let UIMode::FuzzyFind { matches, selected_index, .. } = &mut explorer.ui_mode {
+                                    *matches = new_matches;
+                                    // Clamp selected_index to valid range
+                                    if matches.is_empty() {
+                                        *selected_index = 0;
+                                    } else if *selected_index >= matches.len() {
+                                        *selected_index = matches.len() - 1;
+                                    }
+                                }
+                            }
                         }
                     }
                 }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    // Channel closed, cache building complete
+                    cache_receiver = None;
+                    cache_complete = true;
 
-                cache_receiver = None;
+                    // Trigger one final search with the completed cache
+                    if let UIMode::FuzzyFind { search_term, .. } = &explorer.ui_mode {
+                        if !search_term.is_empty() {
+                            pending_search = true;
+                            last_search_update = Some(Instant::now());
+                        }
+                    }
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    // No update yet, keep waiting
+                }
             }
         }
 
@@ -98,17 +122,25 @@ fn run_app<B: ratatui::backend::Backend>(
             if let Some(last_update) = last_search_update {
                 let elapsed = last_update.elapsed().as_millis();
                 if elapsed >= debounce_ms as u128 {
-                    let (search_term_clone, cache_clone) = if let UIMode::FuzzyFind { search_term, file_cache, .. } = &explorer.ui_mode {
-                        (Some(search_term.clone()), file_cache.clone())
+                    let search_term_clone = if let UIMode::FuzzyFind { search_term, .. } = &explorer.ui_mode {
+                        Some(search_term.clone())
                     } else {
-                        (None, Arc::new(Vec::new()))
+                        None
                     };
 
                     if let Some(term) = search_term_clone {
-                        let new_matches = explorer.perform_fuzzy_search(&term, &cache_clone);
-                        if let UIMode::FuzzyFind { matches, selected_index, .. } = &mut explorer.ui_mode {
-                            *matches = new_matches;
-                            *selected_index = 0;
+                        if !term.is_empty() {
+                            // Always use the latest global cache, not the stale UIMode cache
+                            let new_matches = explorer.perform_fuzzy_search(&term, &explorer.fuzzy_cache);
+                            if let UIMode::FuzzyFind { matches, selected_index, .. } = &mut explorer.ui_mode {
+                                *matches = new_matches;
+                                // Clamp selected_index to valid range
+                                if matches.is_empty() {
+                                    *selected_index = 0;
+                                } else if *selected_index >= matches.len() {
+                                    *selected_index = matches.len() - 1;
+                                }
+                            }
                         }
                     }
 
@@ -148,12 +180,30 @@ fn run_app<B: ratatui::backend::Backend>(
 
             explorer.terminal_width = terminal_width;
 
-            let (tree_items, list_state, title) = if let UIMode::FuzzyFind { search_term, matches, selected_index, file_cache } = &explorer.ui_mode {
-                let cache_building = file_cache.is_empty() && explorer.fuzzy_cache.is_empty();
+            let (tree_items, list_state, title) = if let UIMode::FuzzyFind { search_term, matches, selected_index, file_cache: _ } = &mut explorer.ui_mode {
+                // Clamp selected_index BEFORE rendering to prevent crashes
+                if !matches.is_empty() && *selected_index >= matches.len() {
+                    *selected_index = matches.len() - 1;
+                }
 
-                let fuzzy_items: Vec<ratatui::widgets::ListItem> = if cache_building {
+                let cache_building = !cache_complete;
+                let cache_count = explorer.fuzzy_cache.len();
+
+                let fuzzy_items: Vec<ratatui::widgets::ListItem> = if cache_building && cache_count == 0 {
                     vec![ratatui::widgets::ListItem::new(Line::from(vec![
                         Span::styled("Building file cache, please wait...", Style::default().fg(Color::Rgb(140, 180, 120)))
+                    ]))]
+                } else if cache_building {
+                    vec![ratatui::widgets::ListItem::new(Line::from(vec![
+                        Span::styled(format!("Scanning... {} files found", cache_count), Style::default().fg(Color::Rgb(140, 180, 120)))
+                    ]))]
+                } else if search_term.is_empty() {
+                    vec![ratatui::widgets::ListItem::new(Line::from(vec![
+                        Span::styled(format!("Start typing to search {} files...", cache_count), Style::default().fg(Color::Rgb(140, 180, 120)))
+                    ]))]
+                } else if matches.is_empty() {
+                    vec![ratatui::widgets::ListItem::new(Line::from(vec![
+                        Span::styled(format!("No matches for '{}' (searched {} files)", search_term, cache_count), Style::default().fg(Color::Rgb(140, 180, 120)))
                     ]))]
                 } else {
                     matches
@@ -174,6 +224,11 @@ fn run_app<B: ratatui::backend::Backend>(
                             let mut last_pos = 0;
 
                             for &match_pos in &fuzzy_match.matched_positions {
+                                // Bounds check to prevent panics
+                                if match_pos >= chars.len() {
+                                    continue;
+                                }
+
                                 if match_pos > last_pos {
                                     let non_matched: String = chars[last_pos..match_pos].iter().collect();
                                     let mut style = Style::default().fg(grey_color);
@@ -183,18 +238,16 @@ fn run_app<B: ratatui::backend::Backend>(
                                     spans.push(Span::styled(non_matched, style));
                                 }
 
-                                if match_pos < chars.len() {
-                                    let matched_char = chars[match_pos].to_string();
-                                    let mut style = Style::default().fg(green_color);
-                                    if let Some(bg) = bg_color {
-                                        style = style.bg(bg);
-                                    }
-                                    if is_selected {
-                                        style = style.add_modifier(Modifier::BOLD);
-                                    }
-                                    spans.push(Span::styled(matched_char, style));
-                                    last_pos = match_pos + 1;
+                                let matched_char = chars[match_pos].to_string();
+                                let mut style = Style::default().fg(green_color);
+                                if let Some(bg) = bg_color {
+                                    style = style.bg(bg);
                                 }
+                                if is_selected {
+                                    style = style.add_modifier(Modifier::BOLD);
+                                }
+                                spans.push(Span::styled(matched_char, style));
+                                last_pos = match_pos + 1;
                             }
 
                             if last_pos < chars.len() {
@@ -239,8 +292,11 @@ fn run_app<B: ratatui::backend::Backend>(
 
                 let visual_selected = if cache_building || matches.is_empty() {
                     None
+                } else if *selected_index >= matches.len() {
+                    // Safety check: clamp to valid range
+                    Some(0)
                 } else {
-                    Some(matches.len() - 1 - selected_index)
+                    Some(matches.len() - 1 - *selected_index)
                 };
 
                 let scroll_offset = if let Some(visual_pos) = visual_selected {
@@ -269,9 +325,9 @@ fn run_app<B: ratatui::backend::Backend>(
                     .with_offset(scroll_offset);
 
                 let title = if cache_building {
-                    format!("Fuzzy Find: {} (building cache...)", search_term)
+                    format!("Fuzzy Find: {} (scanning... {} files)", search_term, cache_count)
                 } else {
-                    format!("Fuzzy Find: {} ({} matches)", search_term, matches.len())
+                    format!("Fuzzy Find: {} ({} matches from {} files)", search_term, matches.len(), cache_count)
                 };
                 (fuzzy_items, list_state, title)
             } else {
@@ -971,6 +1027,7 @@ fn run_app<B: ratatui::backend::Backend>(
                                     explorer.toggle_hidden()?;
                                 }
                                 KeyCode::Char('f') if ctrl => {
+                                    // Start fuzzy find mode with current cached files filtered to current dir
                                     let filtered_cache: Vec<CachedFile> = explorer.fuzzy_cache
                                         .iter()
                                         .filter(|f| f.path.starts_with(&explorer.current_dir))
@@ -984,12 +1041,16 @@ fn run_app<B: ratatui::backend::Backend>(
                                         file_cache: Arc::new(filtered_cache),
                                     };
 
+                                    // Rebuild cache for current directory in background
+                                    let (sender, receiver) = mpsc::channel();
                                     let current_dir = explorer.current_dir.clone();
                                     let show_hidden = explorer.show_hidden;
                                     thread::spawn(move || {
                                         let mut fresh_cache = Vec::new();
-                                        build_file_cache_static(&current_dir, None, 0, &mut fresh_cache, show_hidden);
+                                        build_file_cache_static(&current_dir, Some(8), 0, &mut fresh_cache, show_hidden, Some(sender));
                                     });
+                                    cache_receiver = Some(receiver);
+                                    cache_complete = false;
                                 }
                                 _ => {}
                             }

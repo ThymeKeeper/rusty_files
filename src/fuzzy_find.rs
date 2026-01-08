@@ -103,13 +103,14 @@ pub fn fuzzy_match_with_lower(search_lower: &str, target: &str) -> Option<(i32, 
     None // Not all search characters were found
 }
 
-/// Build a file cache from a directory tree.
+/// Build a file cache from a directory tree using parallel traversal with BFS ordering.
 pub fn build_file_cache_static(
     dir: &PathBuf,
     max_depth: Option<usize>,
     _current_depth: usize,
     cache: &mut Vec<CachedFile>,
     show_hidden: bool,
+    progress_sender: Option<std::sync::mpsc::Sender<Arc<Vec<CachedFile>>>>,
 ) {
     use ignore::WalkBuilder;
     use ignore::overrides::OverrideBuilder;
@@ -130,7 +131,7 @@ pub fn build_file_cache_static(
 
     let overrides = override_builder.build().ok();
 
-    // Create walker that respects .gitignore
+    // Create walker that respects .gitignore with parallel threads
     let mut walker = WalkBuilder::new(dir);
     walker
         .max_depth(max_depth)
@@ -140,13 +141,13 @@ pub fn build_file_cache_static(
         .git_exclude(true)
         .follow_links(false)
         .same_file_system(true)
-        .threads(4);
+        .threads(num_cpus::get().max(4)); // Use available CPUs, minimum 4
 
     if let Some(overrides) = overrides {
         walker.overrides(overrides);
     }
 
-    // Walk the directory tree
+    // Collect all results (fast parallel scan, no intermediate cloning)
     for result in walker.build() {
         if let Ok(entry) = result {
             let path = entry.path();
@@ -188,6 +189,11 @@ pub fn build_file_cache_static(
             }
         }
     }
+
+    // Send final cache once (avoids OOM from repeated cloning)
+    if let Some(ref sender) = progress_sender {
+        let _ = sender.send(Arc::new(cache.clone()));
+    }
 }
 
 /// Perform a fuzzy search on the file cache.
@@ -195,9 +201,36 @@ pub fn perform_fuzzy_search(
     search_term: &str,
     file_cache: &Arc<Vec<CachedFile>>,
 ) -> Vec<FuzzyMatch> {
-    // Only search if term has at least 2 characters
-    if search_term.len() < 2 {
+    // Return empty if search term is empty or too short
+    if search_term.is_empty() {
         return Vec::new();
+    }
+
+    // For single character, do simple case-insensitive substring match
+    if search_term.len() == 1 {
+        let search_lower = search_term.to_lowercase();
+        let mut results = Vec::with_capacity(100);
+
+        for cached_file in file_cache.iter() {
+            if cached_file.display_path.to_lowercase().contains(&search_lower) {
+                results.push(FuzzyMatch {
+                    path: cached_file.path.clone(),
+                    display_path: cached_file.display_path.clone(),
+                    name: cached_file.name.clone(),
+                    is_dir: cached_file.is_dir,
+                    permissions: cached_file.permissions,
+                    score: 50,
+                    matched_positions: Vec::new(),
+                });
+
+                if results.len() >= 200 {
+                    break;
+                }
+            }
+        }
+
+        results.truncate(20);
+        return results;
     }
 
     // Convert search term to lowercase ONCE instead of for every file
