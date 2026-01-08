@@ -50,11 +50,8 @@ impl FileExplorer {
     pub fn new() -> io::Result<Self> {
         let current_dir = std::env::current_dir()?;
 
-        let trash_dir = if let Some(home) = std::env::var_os("HOME") {
-            PathBuf::from(home).join(".local/share/rusty_files/trash")
-        } else {
-            PathBuf::from("/tmp/rusty_files_trash")
-        };
+        // Use platform-specific temp directory for trash
+        let trash_dir = std::env::temp_dir().join("rusty_files_trash");
 
         fs::create_dir_all(&trash_dir)?;
 
