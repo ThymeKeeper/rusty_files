@@ -480,11 +480,11 @@ fn run_app<B: ratatui::backend::Backend>(
                                             }
                                         }
                                         OperationType::Delete => {
-                                            match perform_delete_sudo(&op.items, &explorer.trash_dir, &pwd) {
+                                            match perform_delete_sudo(&op.items, &pwd) {
                                                 Ok(deleted_files) => {
                                                     let count = deleted_files.len();
                                                     explorer.undo_stack.push(UndoAction::Delete { deleted_files });
-                                                    explorer.show_status(format!("Deleted {} item(s) with sudo (moved to trash)", count));
+                                                    explorer.show_status(format!("Deleted {} item(s) with elevated privileges", count));
                                                     explorer.selected_indices.clear();
                                                     explorer.selection_anchor = None;
                                                     explorer.load_directory()?;

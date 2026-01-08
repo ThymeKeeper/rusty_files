@@ -57,7 +57,8 @@ pub enum UndoAction {
         moved_files: Vec<(PathBuf, PathBuf)>,
     },
     Delete {
-        deleted_files: Vec<(PathBuf, PathBuf)>,
+        /// Original paths of deleted files (used to find items in system trash for restore)
+        deleted_files: Vec<PathBuf>,
     },
     Rename {
         original_path: PathBuf,

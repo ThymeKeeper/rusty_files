@@ -153,39 +153,26 @@ pub fn validate_sudo_password(password: &str) -> io::Result<()> {
     Ok(())
 }
 
-/// Perform delete operation with sudo.
+/// Perform delete operation with sudo (Unix only - uses gio trash with pkexec).
+#[cfg(unix)]
 pub fn perform_delete_sudo(
     items: &[PathBuf],
-    trash_dir: &PathBuf,
     password: &str,
-) -> io::Result<Vec<(PathBuf, PathBuf)>> {
+) -> io::Result<Vec<PathBuf>> {
     validate_sudo_password(password)?;
     let mut deleted_files = Vec::new();
 
     for item in items {
-        let file_name = item.file_name().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "Invalid file name")
-        })?;
-
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        let trash_name = format!("{}_{}", timestamp, file_name.to_string_lossy());
-        let trash_path = trash_dir.join(trash_name);
-
         let item_str = item.to_str().ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "Invalid path")
         })?;
-        let trash_path_str = trash_path.to_str().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "Invalid trash path")
-        })?;
 
+        // Try using gio trash with sudo
         let mut child = Command::new("sudo")
             .arg("-S")
-            .arg("mv")
+            .arg("gio")
+            .arg("trash")
             .arg(item_str)
-            .arg(trash_path_str)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -197,11 +184,50 @@ pub fn perform_delete_sudo(
 
         let output = child.wait_with_output()?;
         if !output.status.success() {
-            let error_msg = String::from_utf8_lossy(&output.stderr);
-            return Err(io::Error::new(io::ErrorKind::Other, error_msg.to_string()));
+            // Fallback to rm if gio trash fails
+            let mut child = Command::new("sudo")
+                .arg("-S")
+                .arg("rm")
+                .arg("-rf")
+                .arg(item_str)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()?;
+
+            if let Some(mut stdin) = child.stdin.take() {
+                writeln!(stdin, "{}", password)?;
+            }
+
+            let output = child.wait_with_output()?;
+            if !output.status.success() {
+                let error_msg = String::from_utf8_lossy(&output.stderr);
+                return Err(io::Error::new(io::ErrorKind::Other, error_msg.to_string()));
+            }
         }
 
-        deleted_files.push((item.clone(), trash_path));
+        deleted_files.push(item.clone());
+    }
+    Ok(deleted_files)
+}
+
+/// Perform delete operation with elevated privileges (Windows - not supported, use regular delete).
+#[cfg(not(unix))]
+pub fn perform_delete_sudo(
+    items: &[PathBuf],
+    _password: &str,
+) -> io::Result<Vec<PathBuf>> {
+    // On Windows, just try regular trash delete
+    let mut deleted_files = Vec::new();
+    for item in items {
+        match trash::delete(item) {
+            Ok(_) => {
+                deleted_files.push(item.clone());
+            }
+            Err(e) => {
+                return Err(io::Error::new(io::ErrorKind::Other, e.to_string()));
+            }
+        }
     }
     Ok(deleted_files)
 }
@@ -317,36 +343,40 @@ pub fn perform_undo_sudo(action: &UndoAction, password: &str) -> io::Result<usiz
             }
         }
         UndoAction::Delete { deleted_files } => {
-            for (original, trash_path) in deleted_files {
-                if trash_path.exists() {
-                    let trash_path_str = trash_path.to_str().ok_or_else(|| {
-                        io::Error::new(io::ErrorKind::InvalidInput, "Invalid path")
-                    })?;
-                    let original_str = original.to_str().ok_or_else(|| {
-                        io::Error::new(io::ErrorKind::InvalidInput, "Invalid path")
-                    })?;
+            // Try to restore files from system trash
+            match trash::os_limited::list() {
+                Ok(trash_items) => {
+                    let mut items_to_restore = Vec::new();
 
-                    let mut child = Command::new("sudo")
-                        .arg("-S")
-                        .arg("mv")
-                        .arg(trash_path_str)
-                        .arg(original_str)
-                        .stdin(std::process::Stdio::piped())
-                        .stdout(std::process::Stdio::piped())
-                        .stderr(std::process::Stdio::piped())
-                        .spawn()?;
-
-                    if let Some(mut stdin) = child.stdin.take() {
-                        writeln!(stdin, "{}", password)?;
+                    // Find matching items in trash
+                    for original_path in deleted_files {
+                        for item in trash_items.iter() {
+                            if item.original_path() == *original_path {
+                                items_to_restore.push(item.clone());
+                                break;
+                            }
+                        }
                     }
 
-                    let output = child.wait_with_output()?;
-                    if !output.status.success() {
-                        let error_msg = String::from_utf8_lossy(&output.stderr);
-                        return Err(io::Error::new(io::ErrorKind::Other, error_msg.to_string()));
+                    if items_to_restore.is_empty() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::NotFound,
+                            "No matching items found in trash (may have been emptied)",
+                        ));
                     }
 
-                    count += 1;
+                    let restore_count = items_to_restore.len();
+                    match trash::os_limited::restore_all(items_to_restore) {
+                        Ok(_) => {
+                            count = restore_count;
+                        }
+                        Err(e) => {
+                            return Err(io::Error::new(io::ErrorKind::Other, e.to_string()));
+                        }
+                    }
+                }
+                Err(e) => {
+                    return Err(io::Error::new(io::ErrorKind::Other, format!("Cannot access trash: {}", e)));
                 }
             }
         }

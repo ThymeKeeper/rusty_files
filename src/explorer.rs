@@ -32,7 +32,6 @@ pub struct FileExplorer {
     pub clipboard: Option<Clipboard>,
     pub ui_mode: UIMode,
     pub undo_stack: Vec<UndoAction>,
-    pub trash_dir: PathBuf,
     pub drag_selection: Option<usize>,
     pub size_cache: HashMap<PathBuf, u64>,
     pub current_item_size: Option<u64>,
@@ -50,11 +49,6 @@ impl FileExplorer {
     pub fn new() -> io::Result<Self> {
         let current_dir = std::env::current_dir()?;
 
-        // Use platform-specific temp directory for trash
-        let trash_dir = std::env::temp_dir().join("rusty_files_trash");
-
-        fs::create_dir_all(&trash_dir)?;
-
         let mut explorer = FileExplorer {
             current_dir: current_dir.clone(),
             entries: Vec::new(),
@@ -66,7 +60,6 @@ impl FileExplorer {
             clipboard: None,
             ui_mode: UIMode::Normal,
             undo_stack: Vec::new(),
-            trash_dir,
             drag_selection: None,
             size_cache: HashMap::new(),
             current_item_size: None,
@@ -708,24 +701,19 @@ impl FileExplorer {
         let mut deleted_files = Vec::new();
 
         for item in items {
-            let file_name = item.file_name().ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidInput, "Invalid file name")
-            })?;
-
-            let timestamp = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs();
-            let trash_name = format!("{}_{}", timestamp, file_name.to_string_lossy());
-            let trash_path = self.trash_dir.join(trash_name);
-
-            fs::rename(item, &trash_path)?;
-            deleted_files.push((item.clone(), trash_path));
-            count += 1;
+            match trash::delete(item) {
+                Ok(_) => {
+                    deleted_files.push(item.clone());
+                    count += 1;
+                }
+                Err(e) => {
+                    return Err(io::Error::new(io::ErrorKind::Other, e.to_string()));
+                }
+            }
         }
 
         self.undo_stack.push(UndoAction::Delete { deleted_files });
-        self.show_status(format!("Deleted {} item(s) (moved to trash)", count));
+        self.show_status(format!("Deleted {} item(s) (moved to system trash)", count));
         self.selected_indices.clear();
         self.selection_anchor = None;
         self.save_state();
@@ -771,16 +759,39 @@ impl FileExplorer {
                     Ok(())
                 }
                 UndoAction::Delete { deleted_files } => {
-                    let mut count = 0;
-                    for (original, trash_path) in &deleted_files {
-                        if trash_path.exists() {
-                            if let Err(e) = fs::rename(trash_path, original) {
-                                return self.handle_undo_error(e, action_clone);
+                    // Try to restore files from system trash
+                    match trash::os_limited::list() {
+                        Ok(trash_items) => {
+                            let mut items_to_restore = Vec::new();
+
+                            // Find matching items in trash
+                            for original_path in &deleted_files {
+                                for item in trash_items.iter() {
+                                    if item.original_path() == *original_path {
+                                        items_to_restore.push(item.clone());
+                                        break;
+                                    }
+                                }
                             }
-                            count += 1;
+
+                            if items_to_restore.is_empty() {
+                                self.show_status("No matching items found in trash (may have been emptied)".to_string());
+                            } else {
+                                let restore_count = items_to_restore.len();
+                                match trash::os_limited::restore_all(items_to_restore) {
+                                    Ok(_) => {
+                                        self.show_status(format!("Restored {} item(s) from trash", restore_count));
+                                    }
+                                    Err(e) => {
+                                        self.show_status(format!("Failed to restore: {}", e));
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            self.show_status(format!("Cannot access trash: {}", e));
                         }
                     }
-                    self.show_status(format!("Undone delete: restored {} item(s)", count));
                     Ok(())
                 }
                 UndoAction::Rename { original_path, new_path } => {
