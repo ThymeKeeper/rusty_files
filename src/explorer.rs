@@ -735,7 +735,13 @@ impl FileExplorer {
                     count += 1;
                 }
                 Err(e) => {
-                    return Err(io::Error::new(io::ErrorKind::Other, e.to_string()));
+                    // Check if error is permission denied by looking at the error message
+                    let error_msg = e.to_string();
+                    if error_msg.contains("Permission denied") || error_msg.contains("PermissionDenied") {
+                        return Err(io::Error::new(io::ErrorKind::PermissionDenied, error_msg));
+                    } else {
+                        return Err(io::Error::new(io::ErrorKind::Other, error_msg));
+                    }
                 }
             }
         }

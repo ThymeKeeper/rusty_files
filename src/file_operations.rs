@@ -140,6 +140,8 @@ pub fn validate_sudo_password(password: &str) -> io::Result<()> {
 
     if let Some(mut stdin) = child.stdin.take() {
         writeln!(stdin, "{}", password)?;
+        stdin.flush()?;
+        drop(stdin); // Explicitly close stdin
     }
 
     let output = child.wait_with_output()?;
@@ -180,6 +182,8 @@ pub fn perform_delete_sudo(
 
         if let Some(mut stdin) = child.stdin.take() {
             writeln!(stdin, "{}", password)?;
+            stdin.flush()?;
+            drop(stdin);
         }
 
         let output = child.wait_with_output()?;
@@ -197,6 +201,8 @@ pub fn perform_delete_sudo(
 
             if let Some(mut stdin) = child.stdin.take() {
                 writeln!(stdin, "{}", password)?;
+                stdin.flush()?;
+                drop(stdin);
             }
 
             let output = child.wait_with_output()?;
@@ -259,6 +265,8 @@ pub fn perform_rename_sudo(
 
     if let Some(mut stdin) = child.stdin.take() {
         writeln!(stdin, "{}", password)?;
+        stdin.flush()?;
+        drop(stdin);
     }
 
     let output = child.wait_with_output()?;
@@ -296,6 +304,8 @@ pub fn perform_undo_sudo(action: &UndoAction, password: &str) -> io::Result<usiz
 
                     if let Some(mut stdin) = child.stdin.take() {
                         writeln!(stdin, "{}", password)?;
+                        stdin.flush()?;
+                        drop(stdin);
                     }
 
                     let output = child.wait_with_output()?;
@@ -330,6 +340,8 @@ pub fn perform_undo_sudo(action: &UndoAction, password: &str) -> io::Result<usiz
 
                     if let Some(mut stdin) = child.stdin.take() {
                         writeln!(stdin, "{}", password)?;
+                        stdin.flush()?;
+                        drop(stdin);
                     }
 
                     let output = child.wait_with_output()?;
@@ -343,40 +355,83 @@ pub fn perform_undo_sudo(action: &UndoAction, password: &str) -> io::Result<usiz
             }
         }
         UndoAction::Delete { deleted_files } => {
-            // Try to restore files from system trash
-            match trash::os_limited::list() {
-                Ok(trash_items) => {
-                    let mut items_to_restore = Vec::new();
+            #[cfg(unix)]
+            {
+                // On Unix, try to restore from trash using sudo gio command
+                for original_path in deleted_files {
+                    let original_str = original_path.to_str().ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::InvalidInput, "Invalid path")
+                    })?;
 
-                    // Find matching items in trash
-                    for original_path in deleted_files {
-                        for item in trash_items.iter() {
-                            if item.original_path() == *original_path {
-                                items_to_restore.push(item.clone());
-                                break;
-                            }
-                        }
+                    // Use sudo with gio trash --restore (requires URI format)
+                    // First, try to find the file in trash and restore it
+                    let mut child = Command::new("sudo")
+                        .arg("-S")
+                        .arg("gio")
+                        .arg("trash")
+                        .arg("--restore")
+                        .arg(original_str)
+                        .stdin(std::process::Stdio::piped())
+                        .stdout(std::process::Stdio::piped())
+                        .stderr(std::process::Stdio::piped())
+                        .spawn()?;
+
+                    if let Some(mut stdin) = child.stdin.take() {
+                        writeln!(stdin, "{}", password)?;
+                        stdin.flush()?;
+                        drop(stdin);
                     }
 
-                    if items_to_restore.is_empty() {
+                    let output = child.wait_with_output()?;
+                    if !output.status.success() {
+                        // If gio restore fails, provide helpful error message
+                        let error_msg = String::from_utf8_lossy(&output.stderr);
                         return Err(io::Error::new(
-                            io::ErrorKind::NotFound,
-                            "No matching items found in trash (may have been emptied)",
+                            io::ErrorKind::Other,
+                            format!("Cannot restore from trash: {}. Files may have been permanently deleted or trash may have been emptied.", error_msg)
                         ));
                     }
 
-                    let restore_count = items_to_restore.len();
-                    match trash::os_limited::restore_all(items_to_restore) {
-                        Ok(_) => {
-                            count = restore_count;
+                    count += 1;
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                // On non-Unix systems (Windows), try using trash crate restore
+                match trash::os_limited::list() {
+                    Ok(trash_items) => {
+                        let mut items_to_restore = Vec::new();
+
+                        // Find matching items in trash
+                        for original_path in deleted_files {
+                            for item in trash_items.iter() {
+                                if item.original_path() == *original_path {
+                                    items_to_restore.push(item.clone());
+                                    break;
+                                }
+                            }
                         }
-                        Err(e) => {
-                            return Err(io::Error::new(io::ErrorKind::Other, e.to_string()));
+
+                        if items_to_restore.is_empty() {
+                            return Err(io::Error::new(
+                                io::ErrorKind::NotFound,
+                                "No matching items found in trash (may have been emptied)",
+                            ));
+                        }
+
+                        let restore_count = items_to_restore.len();
+                        match trash::os_limited::restore_all(items_to_restore) {
+                            Ok(_) => {
+                                count = restore_count;
+                            }
+                            Err(e) => {
+                                return Err(io::Error::new(io::ErrorKind::Other, e.to_string()));
+                            }
                         }
                     }
-                }
-                Err(e) => {
-                    return Err(io::Error::new(io::ErrorKind::Other, format!("Cannot access trash: {}", e)));
+                    Err(e) => {
+                        return Err(io::Error::new(io::ErrorKind::Other, format!("Cannot access trash: {}", e)));
+                    }
                 }
             }
         }
@@ -401,6 +456,8 @@ pub fn perform_undo_sudo(action: &UndoAction, password: &str) -> io::Result<usiz
 
                 if let Some(mut stdin) = child.stdin.take() {
                     writeln!(stdin, "{}", password)?;
+                    stdin.flush()?;
+                    drop(stdin);
                 }
 
                 let output = child.wait_with_output()?;
@@ -453,6 +510,8 @@ pub fn perform_file_operation_sudo(
 
         if let Some(mut stdin) = child.stdin.take() {
             writeln!(stdin, "{}", password)?;
+            stdin.flush()?;
+            drop(stdin);
         }
 
         let output = child.wait_with_output()?;

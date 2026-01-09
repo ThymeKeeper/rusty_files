@@ -173,11 +173,11 @@ pub fn get_disk_space(path: &Path) -> Option<(u64, u64)> {
 }
 
 /// Get the drive/mount point for a path.
-fn get_drive_label(path: &Path) -> String {
+fn get_drive_label(_path: &Path) -> String {
     #[cfg(windows)]
     {
         // On Windows, get the drive letter (e.g., "C:")
-        if let Some(prefix) = path.components().next() {
+        if let Some(prefix) = _path.components().next() {
             let prefix_str = prefix.as_os_str().to_string_lossy();
             if prefix_str.len() >= 2 && prefix_str.chars().nth(1) == Some(':') {
                 return prefix_str.chars().take(2).collect();
