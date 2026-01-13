@@ -599,6 +599,10 @@ pub fn render_help_screen(f: &mut Frame, area: ratatui::layout::Rect, scroll_off
         Span::styled("Open terminal at current directory", Style::default().fg(desc_color))
     ]));
     help_lines.push(Line::from(vec![
+        Span::styled("    Ctrl+E                        ", Style::default().fg(key_color)),
+        Span::styled("Open file explorer at current directory", Style::default().fg(desc_color))
+    ]));
+    help_lines.push(Line::from(vec![
         Span::styled("    F1                            ", Style::default().fg(key_color)),
         Span::styled("Show/hide this help", Style::default().fg(desc_color))
     ]));

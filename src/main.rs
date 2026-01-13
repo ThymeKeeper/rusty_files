@@ -1071,6 +1071,54 @@ fn run_app<B: ratatui::backend::Backend>(
                                         }
                                     }
                                 }
+                                KeyCode::Char('e') if ctrl => {
+                                    let dir = explorer.current_dir.clone();
+
+                                    let dir_str = match dir.to_str() {
+                                        Some(s) => s,
+                                        None => {
+                                            explorer.show_status("Invalid directory path".to_string());
+                                            continue;
+                                        }
+                                    };
+
+                                    let result = if cfg!(target_os = "windows") {
+                                        // Windows: Use explorer.exe
+                                        std::process::Command::new("explorer")
+                                            .arg(dir_str)
+                                            .stdin(std::process::Stdio::null())
+                                            .stdout(std::process::Stdio::null())
+                                            .stderr(std::process::Stdio::null())
+                                            .spawn()
+                                    } else if cfg!(target_os = "macos") {
+                                        // macOS: Use open -a Finder
+                                        std::process::Command::new("open")
+                                            .arg("-a")
+                                            .arg("Finder")
+                                            .arg(dir_str)
+                                            .stdin(std::process::Stdio::null())
+                                            .stdout(std::process::Stdio::null())
+                                            .stderr(std::process::Stdio::null())
+                                            .spawn()
+                                    } else {
+                                        // Linux/Unix: Use xdg-open
+                                        std::process::Command::new("xdg-open")
+                                            .arg(dir_str)
+                                            .stdin(std::process::Stdio::null())
+                                            .stdout(std::process::Stdio::null())
+                                            .stderr(std::process::Stdio::null())
+                                            .spawn()
+                                    };
+
+                                    match result {
+                                        Ok(_) => {
+                                            explorer.show_status("Opened file explorer".to_string());
+                                        }
+                                        Err(e) => {
+                                            explorer.show_error(format!("Failed to open file explorer: {}", e));
+                                        }
+                                    }
+                                }
                                 KeyCode::Up => explorer.move_up(shift),
                                 KeyCode::Down => explorer.move_down(shift),
                                 KeyCode::Enter => explorer.open_or_enter()?,
