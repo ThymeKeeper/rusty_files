@@ -1083,9 +1083,11 @@ fn run_app<B: ratatui::backend::Backend>(
                                     };
 
                                     let result = if cfg!(target_os = "windows") {
-                                        // Windows: Use explorer.exe
+                                        // Windows: Use explorer.exe with proper path format
+                                        // Convert forward slashes to backslashes for Windows
+                                        let windows_path = dir_str.replace("/", "\\");
                                         std::process::Command::new("explorer")
-                                            .arg(dir_str)
+                                            .arg(&windows_path)
                                             .stdin(std::process::Stdio::null())
                                             .stdout(std::process::Stdio::null())
                                             .stderr(std::process::Stdio::null())
