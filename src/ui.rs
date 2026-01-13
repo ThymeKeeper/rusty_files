@@ -763,7 +763,7 @@ pub fn render_status_bar(
             _ => {
                 let total_items = explorer.entries.len();
                 let selected_count = explorer.selected_indices.len();
-                let text = if selected_count > 0 {
+                let mut text = if selected_count > 0 {
                     let total_size = explorer.get_selected_total_size();
                     let size_str = format_file_size(total_size);
                     format!("{} items | {} selected | {}", total_items, selected_count, size_str)
@@ -778,6 +778,12 @@ pub fn render_status_bar(
                 } else {
                     format!("{} items", total_items)
                 };
+
+                // Add cut operation indicator
+                if explorer.has_active_cut() {
+                    text.push_str(" | \u{2702} Cut active (Esc to cancel)");
+                }
+
                 (text, StatusType::Info)
             }
         }

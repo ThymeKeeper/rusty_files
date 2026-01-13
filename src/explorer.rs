@@ -12,6 +12,7 @@ use std::process::Command;
 use std::sync::Arc;
 use std::time::SystemTime;
 
+use crate::clipboard_file;
 use crate::file_operations::{get_default_file_content, perform_file_operation_tracked};
 use crate::fuzzy_find::{build_file_cache_static, perform_fuzzy_search};
 use crate::types::{
@@ -42,6 +43,9 @@ pub struct FileExplorer {
     pub status_message_time: Option<std::time::Instant>,
     pub fuzzy_cache: Arc<Vec<CachedFile>>,
     pub help_scroll_offset: usize,
+    pub cut_operation_time: Option<std::time::Instant>,
+    pub cut_items: Vec<PathBuf>,
+    pub last_cut_poll_time: Option<std::time::Instant>,
 }
 
 impl FileExplorer {
@@ -70,6 +74,9 @@ impl FileExplorer {
             status_message_time: None,
             fuzzy_cache: Arc::new(Vec::new()),
             help_scroll_offset: 0,
+            cut_operation_time: None,
+            cut_items: Vec::new(),
+            last_cut_poll_time: None,
         };
         explorer.load_directory()?;
         Ok(explorer)
@@ -516,11 +523,25 @@ impl FileExplorer {
     pub fn copy_selected(&mut self) {
         let items = self.get_selected_paths();
         if !items.is_empty() {
-            self.clipboard = Some(Clipboard {
+            let clipboard = Clipboard {
                 items,
                 operation: ClipboardOp::Copy,
-            });
-            self.show_status(format!("Copied {} item(s)", self.clipboard.as_ref().unwrap().items.len()));
+            };
+
+            // Write to shared clipboard file for cross-instance support
+            if let Err(e) = clipboard_file::write_clipboard(&clipboard) {
+                self.show_status(format!("Warning: Failed to write clipboard file: {}", e));
+            }
+
+            let count = clipboard.items.len();
+            self.clipboard = Some(clipboard);
+
+            // Clear cut operation tracking (copy replaces cut)
+            self.cut_operation_time = None;
+            self.cut_items.clear();
+            self.last_cut_poll_time = None;
+
+            self.show_status(format!("Copied {} item(s)", count));
         }
     }
 
@@ -528,17 +549,38 @@ impl FileExplorer {
     pub fn cut_selected(&mut self) {
         let items = self.get_selected_paths();
         if !items.is_empty() {
-            self.clipboard = Some(Clipboard {
-                items,
+            let clipboard = Clipboard {
+                items: items.clone(),
                 operation: ClipboardOp::Cut,
-            });
-            self.show_status(format!("Cut {} item(s)", self.clipboard.as_ref().unwrap().items.len()));
+            };
+
+            // Write to shared clipboard file for cross-instance support
+            if let Err(e) = clipboard_file::write_clipboard(&clipboard) {
+                self.show_status(format!("Warning: Failed to write clipboard file: {}", e));
+            }
+
+            let count = clipboard.items.len();
+            self.clipboard = Some(clipboard);
+
+            // Track cut operation for polling
+            self.cut_operation_time = Some(std::time::Instant::now());
+            self.cut_items = items;
+            self.last_cut_poll_time = Some(std::time::Instant::now());
+
+            self.show_status(format!("Cut {} item(s) - Press Esc to cancel", count));
         }
     }
 
     /// Paste items from clipboard.
     pub fn paste(&mut self) -> io::Result<()> {
-        if let Some(clipboard) = &self.clipboard {
+        // Try to read from clipboard file first (for cross-instance support)
+        let clipboard = match clipboard_file::read_clipboard() {
+            Ok(Some(file_clipboard)) => Some(file_clipboard),
+            Ok(None) => self.clipboard.clone(), // Fall back to internal clipboard
+            Err(_) => self.clipboard.clone(), // Fall back to internal clipboard on error
+        };
+
+        if let Some(clipboard) = clipboard {
             let destination = self.current_dir.clone();
             let items = clipboard.items.clone();
             let is_move = matches!(clipboard.operation, ClipboardOp::Cut);
@@ -546,7 +588,20 @@ impl FileExplorer {
             match perform_file_operation_tracked(&items, &destination, is_move) {
                 Ok((count, undo_action)) => {
                     if is_move {
+                        // Clear both internal and file-based clipboard after move
                         self.clipboard = None;
+
+                        // Clear cut operation tracking immediately
+                        self.cut_operation_time = None;
+                        self.cut_items.clear();
+                        self.last_cut_poll_time = None;
+
+                        if let Err(e) = clipboard_file::write_clipboard(&Clipboard {
+                            items: Vec::new(),
+                            operation: ClipboardOp::Copy,
+                        }) {
+                            self.show_status(format!("Warning: Failed to clear clipboard file: {}", e));
+                        }
                     }
 
                     let pasted_names: Vec<String> = match &undo_action {
@@ -1217,5 +1272,77 @@ impl FileExplorer {
             locations,
             selected_index: 0,
         };
+    }
+
+    /// Check if a cut operation has been completed (pasted in another instance).
+    /// Returns true if the directory should be refreshed.
+    pub fn check_cut_completion(&mut self) -> bool {
+        if self.cut_operation_time.is_none() {
+            return false;
+        }
+
+        // Only poll every 1 second
+        if let Some(last_poll) = self.last_cut_poll_time {
+            if last_poll.elapsed() < std::time::Duration::from_secs(1) {
+                return false;
+            }
+        }
+        self.last_cut_poll_time = Some(std::time::Instant::now());
+
+        // Check timeout (2 minutes)
+        if let Some(cut_time) = self.cut_operation_time {
+            if cut_time.elapsed() > std::time::Duration::from_secs(120) {
+                self.cancel_cut_operation();
+                self.show_status("Cut operation timed out".to_string());
+                return false;
+            }
+        }
+
+        // Read current clipboard state
+        match clipboard_file::read_clipboard() {
+            Ok(Some(clipboard)) => {
+                // Check if clipboard contains exactly our cut items (not just contains)
+                if clipboard.items != self.cut_items {
+                    // Clipboard changed to different items - another instance cut something
+                    // Just cancel our cut operation silently
+                    self.cut_operation_time = None;
+                    self.cut_items.clear();
+                    self.clipboard = None;
+                    return false;
+                }
+                // Still our items, keep waiting
+                false
+            }
+            Ok(None) => {
+                // Clipboard is empty/cleared - paste happened!
+                self.cut_operation_time = None;
+                self.cut_items.clear();
+                self.clipboard = None;
+                true
+            }
+            Err(_) => {
+                // Error reading clipboard - assume paste happened
+                self.cut_operation_time = None;
+                self.cut_items.clear();
+                self.clipboard = None;
+                true
+            }
+        }
+    }
+
+    /// Cancel an active cut operation.
+    pub fn cancel_cut_operation(&mut self) {
+        if self.cut_operation_time.is_some() {
+            self.cut_operation_time = None;
+            self.cut_items.clear();
+            self.last_cut_poll_time = None;
+            self.clipboard = None;
+            self.show_status("Cut operation cancelled".to_string());
+        }
+    }
+
+    /// Check if there's an active cut operation.
+    pub fn has_active_cut(&self) -> bool {
+        self.cut_operation_time.is_some()
     }
 }

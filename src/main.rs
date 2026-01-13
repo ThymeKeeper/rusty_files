@@ -3,6 +3,7 @@
 //! This application provides a feature-rich file explorer with fuzzy finding,
 //! tree view navigation, file operations, and more.
 
+mod clipboard_file;
 mod explorer;
 mod file_operations;
 mod fuzzy_find;
@@ -66,6 +67,15 @@ fn run_app<B: ratatui::backend::Backend>(
     let mut cache_complete = false;
 
     loop {
+        // Check if cut operation has been completed in another instance
+        if explorer.has_active_cut() && explorer.check_cut_completion() {
+            if let Err(e) = explorer.load_directory() {
+                explorer.show_error(format!("Failed to refresh directory: {}", e));
+            } else {
+                explorer.show_status("Directory refreshed after cut operation".to_string());
+            }
+        }
+
         // Check if cache is ready from background thread
         if let Some(ref receiver) = cache_receiver {
             match receiver.try_recv() {
@@ -1145,6 +1155,11 @@ fn run_app<B: ratatui::backend::Backend>(
                                 }
                                 KeyCode::Char('g') if ctrl => {
                                     explorer.open_quick_nav();
+                                }
+                                KeyCode::Esc => {
+                                    if explorer.has_active_cut() {
+                                        explorer.cancel_cut_operation();
+                                    }
                                 }
                                 _ => {}
                             }
