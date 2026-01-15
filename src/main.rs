@@ -970,17 +970,20 @@ fn run_app<B: ratatui::backend::Backend>(
                                     };
 
                                     let result = if cfg!(target_os = "windows") {
-                                        // Escape single quotes for PowerShell by doubling them
+                                        // Use -p to specify profile (for colors) and Set-Location (for directory)
+                                        // Note: Use windowingBehavior setting in WT to control new window vs tab
                                         let ps_escaped = dir_str.replace("'", "''");
-
-                                        // Try Windows Terminal with PowerShell cd command
                                         let wt_result = std::process::Command::new("wt")
-                                            .arg("new-tab")
-                                            .arg("--")
-                                            .arg("powershell")
-                                            .arg("-NoExit")
-                                            .arg("-Command")
-                                            .arg(format!("Set-Location -LiteralPath '{}'", ps_escaped))
+                                            .args([
+                                                "-p",
+                                                "PowerShell",
+                                                "--",
+                                                "powershell",
+                                                "-NoExit",
+                                                "-NoLogo",
+                                                "-Command",
+                                                &format!("Set-Location -LiteralPath '{}'", ps_escaped),
+                                            ])
                                             .stdin(std::process::Stdio::null())
                                             .stdout(std::process::Stdio::null())
                                             .stderr(std::process::Stdio::null())
