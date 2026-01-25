@@ -11,6 +11,11 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Arc;
 use std::time::SystemTime;
+use crossterm::{
+    execute,
+    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    event::{DisableMouseCapture, EnableMouseCapture},
+};
 
 use crate::clipboard_file;
 use crate::file_operations::{get_default_file_content, perform_file_operation_tracked};
@@ -417,17 +422,77 @@ impl FileExplorer {
                 .stderr(std::process::Stdio::null())
                 .spawn()?;
         } else {
-            let command = format!("setsid -f xdg-open '{}' >/dev/null 2>&1 &", path_str);
-            Command::new("sh")
-                .arg("-c")
-                .arg(&command)
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn()?;
+            // On Linux/Unix, check if we're in a terminal-only environment (SSH, no X11)
+            let in_ssh = std::env::var("SSH_CONNECTION").is_ok()
+                      || std::env::var("SSH_CLIENT").is_ok()
+                      || std::env::var("SSH_TTY").is_ok();
+            let no_display = std::env::var("DISPLAY").is_err();
+            let has_editor = std::env::var("EDITOR").is_ok() || std::env::var("VISUAL").is_ok();
+
+            // If we're in SSH or no display, and we have an EDITOR set, use it for text files
+            if (in_ssh || no_display) && has_editor && Self::is_likely_text_file(path) {
+                // Use EDITOR/VISUAL for text files in terminal environment
+                let editor = std::env::var("EDITOR")
+                    .or_else(|_| std::env::var("VISUAL"))
+                    .unwrap_or_else(|_| "vi".to_string());
+
+                // Suspend TUI: disable raw mode, leave alternate screen, disable mouse
+                disable_raw_mode()?;
+                let mut stdout = io::stdout();
+                execute!(stdout, LeaveAlternateScreen, DisableMouseCapture)?;
+
+                // Launch editor and wait for it to finish
+                let status = Command::new(&editor)
+                    .arg(path_str)
+                    .status();
+
+                // Resume TUI: re-enable raw mode, re-enter alternate screen, re-enable mouse
+                enable_raw_mode()?;
+                execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+
+                // Check if editor launched successfully
+                status?;
+            } else {
+                // Use xdg-open for GUI applications
+                let command = format!("setsid -f xdg-open '{}' >/dev/null 2>&1 &", path_str);
+                Command::new("sh")
+                    .arg("-c")
+                    .arg(&command)
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()?;
+            }
         }
 
         Ok(())
+    }
+
+    /// Check if a file is likely a text file based on extension
+    fn is_likely_text_file(path: &PathBuf) -> bool {
+        if let Some(ext) = path.extension() {
+            let ext = ext.to_string_lossy().to_lowercase();
+            matches!(
+                ext.as_str(),
+                "txt" | "md" | "rs" | "py" | "js" | "ts" | "jsx" | "tsx" | "json" | "toml" | "yaml" | "yml" |
+                "xml" | "html" | "css" | "sh" | "bash" | "zsh" | "fish" | "c" | "cpp" | "h" | "hpp" |
+                "java" | "go" | "rb" | "php" | "pl" | "lua" | "vim" | "sql" | "log" | "conf" | "ini" |
+                "env" | "gitignore" | "dockerfile" | "makefile" | "cmake" | "gradle" | "properties" |
+                "tex" | "r" | "jl" | "swift" | "kt" | "scala" | "hs" | "ml" | "fs" | "clj" | "ex" | "exs"
+            )
+        } else {
+            // Files without extension might be text (like README, Makefile, etc.)
+            if let Some(name) = path.file_name() {
+                let name = name.to_string_lossy().to_lowercase();
+                matches!(
+                    name.as_str(),
+                    "readme" | "makefile" | "dockerfile" | "license" | "changelog" | "todo" |
+                    "authors" | "contributors" | "gemfile" | "rakefile" | "vagrantfile"
+                )
+            } else {
+                false
+            }
+        }
     }
 
     /// Open or enter the item at cursor.
