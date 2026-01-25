@@ -13,8 +13,9 @@ use std::sync::Arc;
 use std::time::SystemTime;
 use crossterm::{
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen, Clear, ClearType},
     event::{DisableMouseCapture, EnableMouseCapture},
+    cursor::MoveTo,
 };
 
 use crate::clipboard_file;
@@ -299,6 +300,12 @@ impl FileExplorer {
             return;
         }
 
+        // If cursor is on the first item, scroll to the very top to show full path
+        if self.cursor_index == 0 {
+            self.scroll_offset = 0;
+            return;
+        }
+
         let cursor_line_idx = tree_lines.iter()
             .position(|line| line.is_cursor)
             .unwrap_or(0);
@@ -448,7 +455,14 @@ impl FileExplorer {
 
                 // Resume TUI: re-enable raw mode, re-enter alternate screen, re-enable mouse
                 enable_raw_mode()?;
-                execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+                execute!(
+                    stdout,
+                    EnterAlternateScreen,
+                    EnableMouseCapture,
+                    Clear(ClearType::All),
+                    MoveTo(0, 0)
+                )?;
+                stdout.flush()?;
 
                 // Check if editor launched successfully
                 status?;
