@@ -160,6 +160,12 @@ fn run_app<B: ratatui::backend::Backend>(
             }
         }
 
+        // Force full redraw if needed (e.g., after returning from editor)
+        if explorer.needs_full_redraw {
+            terminal.clear()?;
+            explorer.needs_full_redraw = false;
+        }
+
         terminal.draw(|f| {
             let area = f.area();
 

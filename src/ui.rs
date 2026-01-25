@@ -788,6 +788,11 @@ pub fn render_status_bar(
                     text.push_str(" | \u{2702} Cut active (Esc to cancel)");
                 }
 
+                // Add SSH indicator
+                if explorer.is_ssh {
+                    text.push_str(" | \u{f817} SSH");
+                }
+
                 (text, StatusType::Info)
             }
         }

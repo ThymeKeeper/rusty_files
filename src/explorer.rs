@@ -52,6 +52,8 @@ pub struct FileExplorer {
     pub cut_operation_time: Option<std::time::Instant>,
     pub cut_items: Vec<PathBuf>,
     pub last_cut_poll_time: Option<std::time::Instant>,
+    pub is_ssh: bool,
+    pub needs_full_redraw: bool,
 }
 
 impl FileExplorer {
@@ -83,6 +85,10 @@ impl FileExplorer {
             cut_operation_time: None,
             cut_items: Vec::new(),
             last_cut_poll_time: None,
+            is_ssh: std::env::var("SSH_CONNECTION").is_ok()
+                 || std::env::var("SSH_CLIENT").is_ok()
+                 || std::env::var("SSH_TTY").is_ok(),
+            needs_full_redraw: false,
         };
         explorer.load_directory()?;
         Ok(explorer)
@@ -463,6 +469,9 @@ impl FileExplorer {
                     MoveTo(0, 0)
                 )?;
                 stdout.flush()?;
+
+                // Signal that we need a full redraw
+                self.needs_full_redraw = true;
 
                 // Check if editor launched successfully
                 status?;
