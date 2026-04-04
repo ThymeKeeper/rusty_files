@@ -119,6 +119,9 @@ pub enum UIMode {
         locations: Vec<QuickNavLocation>,
         selected_index: usize,
     },
+    SetupGuide {
+        message: Vec<String>,
+    },
 }
 
 /// A quick navigation location.

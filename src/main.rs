@@ -24,6 +24,7 @@ use ratatui::{
     Terminal,
 };
 use std::io;
+use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver};
 use std::sync::Arc;
 use std::thread;
@@ -38,14 +39,15 @@ use crate::types::{CachedFile, CreationType, OperationType, UIMode, UndoAction};
 use crate::ui::{
     build_tree_items, format_disk_info, get_file_icon, format_permissions,
     render_create_dialog, render_delete_dialog, render_help_screen,
-    render_password_dialog, render_quick_nav_popup, render_rename_dialog, render_status_bar,
+    render_password_dialog, render_quick_nav_popup, render_rename_dialog, render_setup_guide,
+    render_status_bar,
 };
 
 /// Run the main application loop.
 fn run_app<B: ratatui::backend::Backend>(
     terminal: &mut Terminal<B>,
     mut explorer: FileExplorer,
-) -> io::Result<()> {
+) -> io::Result<PathBuf> {
     // Debouncing for fuzzy find search
     let mut last_search_update: Option<Instant> = None;
     let mut pending_search: bool = false;
@@ -65,10 +67,12 @@ fn run_app<B: ratatui::backend::Backend>(
         Some(receiver)
     };
     let mut cache_complete = false;
+    let mut needs_redraw = true;
 
     loop {
         // Check if cut operation has been completed in another instance
         if explorer.has_active_cut() && explorer.check_cut_completion() {
+            needs_redraw = true;
             if let Err(e) = explorer.load_directory() {
                 explorer.show_error(format!("Failed to refresh directory: {}", e));
             } else {
@@ -81,6 +85,7 @@ fn run_app<B: ratatui::backend::Backend>(
             match receiver.try_recv() {
                 Ok(file_cache) => {
                     // Received incremental update
+                    needs_redraw = true;
                     explorer.fuzzy_cache = file_cache.clone();
 
                     let (search_term_clone, should_search) = if let UIMode::FuzzyFind { search_term, file_cache: cache, .. } = &mut explorer.ui_mode {
@@ -110,6 +115,7 @@ fn run_app<B: ratatui::backend::Backend>(
                 }
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                     // Channel closed, cache building complete
+                    needs_redraw = true;
                     cache_receiver = None;
                     cache_complete = true;
 
@@ -156,6 +162,7 @@ fn run_app<B: ratatui::backend::Backend>(
 
                     pending_search = false;
                     last_search_update = None;
+                    needs_redraw = true;
                 }
             }
         }
@@ -164,8 +171,11 @@ fn run_app<B: ratatui::backend::Backend>(
         if explorer.needs_full_redraw {
             terminal.clear()?;
             explorer.needs_full_redraw = false;
+            needs_redraw = true;
         }
 
+        if needs_redraw {
+        needs_redraw = false;
         terminal.draw(|f| {
             let area = f.area();
 
@@ -410,16 +420,24 @@ fn run_app<B: ratatui::backend::Backend>(
             if let UIMode::QuickNav { ref locations, selected_index } = explorer.ui_mode {
                 render_quick_nav_popup(f, locations, selected_index);
             }
+
+            // Render setup guide popup
+            if let UIMode::SetupGuide { ref message } = explorer.ui_mode {
+                render_setup_guide(f, message);
+            }
         })?;
+        } // needs_redraw
 
         // Auto-dismiss status messages after 3 seconds
         if let Some(time) = explorer.status_message_time {
             if time.elapsed() > std::time::Duration::from_secs(3) {
                 explorer.clear_status();
+                needs_redraw = true;
             }
         }
 
         if event::poll(std::time::Duration::from_millis(100))? {
+            needs_redraw = true;
             match event::read()? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
                     if explorer.status_message.is_some() {
@@ -812,7 +830,7 @@ fn run_app<B: ratatui::backend::Backend>(
                         UIMode::FuzzyFind { .. } => {
                             match key.code {
                                 KeyCode::Char('q') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                                    return Ok(());
+                                    return Ok(explorer.current_dir.clone());
                                 }
                                 KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                                     if let UIMode::FuzzyFind { matches, selected_index, .. } = &explorer.ui_mode {
@@ -952,6 +970,10 @@ fn run_app<B: ratatui::backend::Backend>(
                                 _ => {}
                             }
                         }
+                        UIMode::SetupGuide { .. } => {
+                            // Dismiss on any key
+                            explorer.ui_mode = UIMode::Normal;
+                        }
                         UIMode::Normal | UIMode::StatusMessage { .. } => {
                             let shift = key.modifiers.contains(KeyModifiers::SHIFT);
                             let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
@@ -960,7 +982,7 @@ fn run_app<B: ratatui::backend::Backend>(
                                 KeyCode::F(1) => {
                                     explorer.toggle_help();
                                 }
-                                KeyCode::Char('q') if ctrl => return Ok(()),
+                                KeyCode::Char('q') if ctrl => return Ok(explorer.current_dir.clone()),
                                 KeyCode::Char('l') if ctrl => {
                                     terminal.clear()?;
                                 }
@@ -1272,22 +1294,148 @@ fn run_app<B: ratatui::backend::Backend>(
     }
 }
 
+/// Create shell wrapper scripts next to the executable if they don't already exist.
+fn create_wrapper_scripts() {
+    let exe_path = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(_) => return,
+    };
+    let exe_dir = match exe_path.parent() {
+        Some(d) => d,
+        None => return,
+    };
+    let lastdir = {
+        let temp = std::fs::canonicalize(std::env::temp_dir())
+            .unwrap_or_else(|_| std::env::temp_dir());
+        // Strip \\?\ prefix that Windows canonicalize adds — cmd.exe can't handle it
+        let s = temp.display().to_string();
+        PathBuf::from(s.strip_prefix(r"\\?\").unwrap_or(&s).to_string())
+    }.join("rusty_files_lastdir");
+
+    if cfg!(target_os = "windows") {
+        // rf.bat for cmd.exe / PowerShell
+        let bat_path = exe_dir.join("rf.bat");
+        if !bat_path.exists() {
+            let bat_content = format!(
+                "@echo off\r\n\
+                 set RF_WRAPPER=1\r\n\
+                 \"{exe}\" %*\r\n\
+                 if exist \"{lastdir}\" (\r\n\
+                     set /p RF_DIR=<\"{lastdir}\"\r\n\
+                     cd /d \"%RF_DIR%\"\r\n\
+                 )\r\n",
+                exe = exe_path.display(),
+                lastdir = lastdir.display(),
+            );
+            let _ = std::fs::write(&bat_path, bat_content);
+        }
+    } else {
+        // rf shell script for bash/zsh
+        let sh_path = exe_dir.join("rf");
+        if !sh_path.exists() {
+            let sh_content = format!(
+                "#!/bin/sh\n\
+                 export RF_WRAPPER=1\n\
+                 \"{exe}\" \"$@\"\n\
+                 lastdir=\"{lastdir}\"\n\
+                 if [ -f \"$lastdir\" ]; then\n\
+                     dir=\"$(cat \"$lastdir\")\"\n\
+                     [ -d \"$dir\" ] && cd \"$dir\"\n\
+                 fi\n",
+                exe = exe_path.display(),
+                lastdir = lastdir.display(),
+            );
+            let _ = std::fs::write(&sh_path, sh_content);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&sh_path, std::fs::Permissions::from_mode(0o755));
+            }
+        }
+    }
+}
+
 fn main() -> io::Result<()> {
+    create_wrapper_scripts();
+
+    // Prevent Ctrl+C from terminating the program on Windows
+    // This allows crossterm to capture it as a key event instead
+    ctrlc::set_handler(|| {}).expect("Error setting Ctrl-C handler");
+
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture, crossterm::terminal::SetTitle("rusty_files"))?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let explorer = FileExplorer::new()?;
+    let mut explorer = FileExplorer::new()?;
+
+    // Show setup guide if not launched from wrapper script
+    if std::env::var("RF_WRAPPER").is_err() {
+        let exe_path = std::env::current_exe().unwrap_or_default();
+        let exe_dir = exe_path.parent().map(|p| p.display().to_string()).unwrap_or_default();
+
+        let mut lines = vec![
+            "rusty_files can cd your shell on exit,".to_string(),
+            "but it needs to be launched via a wrapper.".to_string(),
+            String::new(),
+        ];
+
+        if cfg!(target_os = "windows") {
+            lines.extend([
+                "For PowerShell, add this function to $PROFILE:".to_string(),
+                String::new(),
+                format!("  function rf {{"),
+                format!("    $env:RF_WRAPPER = \"1\""),
+                format!("    & \"{}\" @args", exe_path.display()),
+                format!("    $f = \"$env:TEMP\\rusty_files_lastdir\""),
+                format!("    if (Test-Path $f) {{"),
+                format!("      $d = Get-Content $f"),
+                format!("      if (Test-Path $d) {{ Set-Location $d }}"),
+                format!("    }}"),
+                format!("  }}"),
+                String::new(),
+                format!("For cmd.exe, use: {}\\rf.bat", exe_dir),
+            ]);
+        } else {
+            lines.extend([
+                "Add this function to your shell profile:".to_string(),
+                String::new(),
+                format!("  rf() {{"),
+                format!("    export RF_WRAPPER=1"),
+                format!("    \"{}\" \"$@\"", exe_path.display()),
+                format!("    f=\"/tmp/rusty_files_lastdir\""),
+                format!("    [ -f \"$f\" ] && cd \"$(cat \"$f\")\""),
+                format!("  }}"),
+            ]);
+        }
+
+        lines.push(String::new());
+        lines.push("Press any key to continue...".to_string());
+
+        explorer.ui_mode = UIMode::SetupGuide { message: lines };
+    }
+
     let res = run_app(&mut terminal, explorer);
 
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
     terminal.show_cursor()?;
 
-    if let Err(err) = res {
-        println!("Error: {:?}", err);
+    match res {
+        Ok(last_dir) => {
+            // Write last directory to temp file so a shell wrapper can cd there
+            let lastdir_path = {
+                let temp = std::fs::canonicalize(std::env::temp_dir())
+                    .unwrap_or_else(|_| std::env::temp_dir());
+                let s = temp.display().to_string();
+                PathBuf::from(s.strip_prefix(r"\\?\").unwrap_or(&s).to_string())
+            }.join("rusty_files_lastdir");
+            let _ = std::fs::write(&lastdir_path, last_dir.display().to_string());
+        }
+        Err(err) => {
+            println!("Error: {:?}", err);
+        }
     }
 
     Ok(())

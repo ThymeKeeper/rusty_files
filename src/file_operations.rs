@@ -40,8 +40,23 @@ pub fn get_unique_path(dest_path: &PathBuf) -> PathBuf {
     }
 }
 
+/// Maximum recursion depth for directory copies to prevent stack overflow
+/// from symlink/junction cycles.
+const MAX_COPY_DEPTH: usize = 64;
+
 /// Copy a directory recursively.
 pub fn copy_dir_recursive(src: &PathBuf, dst: &PathBuf) -> io::Result<()> {
+    copy_dir_recursive_inner(src, dst, 0)
+}
+
+fn copy_dir_recursive_inner(src: &PathBuf, dst: &PathBuf, depth: usize) -> io::Result<()> {
+    if depth > MAX_COPY_DEPTH {
+        return Err(io::Error::new(
+            io::ErrorKind::Other,
+            format!("Directory copy exceeded maximum depth ({}). Possible symlink cycle at: {}", MAX_COPY_DEPTH, src.display()),
+        ));
+    }
+
     fs::create_dir_all(dst)?;
     for entry in fs::read_dir(src)? {
         let entry = entry?;
@@ -49,8 +64,13 @@ pub fn copy_dir_recursive(src: &PathBuf, dst: &PathBuf) -> io::Result<()> {
         let src_path = entry.path();
         let dst_path = dst.join(entry.file_name());
 
+        // Skip symlinks and junctions to avoid cycles and unexpected behavior
+        if file_type.is_symlink() {
+            continue;
+        }
+
         if file_type.is_dir() {
-            copy_dir_recursive(&src_path, &dst_path)?;
+            copy_dir_recursive_inner(&src_path, &dst_path, depth + 1)?;
         } else {
             fs::copy(&src_path, &dst_path)?;
         }

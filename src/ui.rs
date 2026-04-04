@@ -897,3 +897,50 @@ pub fn render_quick_nav_popup(
 
     f.render_widget(list, popup_area);
 }
+
+pub fn render_setup_guide(f: &mut Frame, lines: &[String]) {
+    let area = f.area();
+
+    let content_width = lines.iter().map(|l| l.len()).max().unwrap_or(40) as u16 + 4;
+    let popup_width = content_width.min(area.width.saturating_sub(4));
+    let popup_height = (lines.len() as u16 + 4).min(area.height.saturating_sub(4));
+
+    let popup_x = (area.width.saturating_sub(popup_width)) / 2;
+    let popup_y = (area.height.saturating_sub(popup_height)) / 2;
+
+    let popup_area = ratatui::layout::Rect::new(popup_x, popup_y, popup_width, popup_height);
+
+    f.render_widget(Clear, popup_area);
+
+    let text: Vec<Line> = lines
+        .iter()
+        .map(|line| {
+            if line.starts_with("  ") {
+                // Code lines in green
+                Line::from(Span::styled(
+                    format!(" {}", line),
+                    Style::default().fg(Color::Rgb(140, 180, 120)),
+                ))
+            } else if line.is_empty() {
+                Line::from("")
+            } else {
+                Line::from(Span::styled(
+                    format!(" {}", line),
+                    Style::default().fg(Color::Rgb(185, 177, 160)),
+                ))
+            }
+        })
+        .collect();
+
+    let paragraph = Paragraph::new(text)
+        .block(
+            Block::bordered()
+                .title(" Setup Guide ")
+                .title_style(Style::default().fg(Color::Rgb(140, 180, 120)).add_modifier(Modifier::BOLD))
+                .border_style(Style::default().fg(Color::Rgb(100, 100, 100)))
+                .style(Style::default().bg(Color::Rgb(45, 45, 45)))
+        )
+        .wrap(ratatui::widgets::Wrap { trim: false });
+
+    f.render_widget(paragraph, popup_area);
+}
